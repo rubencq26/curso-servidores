@@ -13,9 +13,9 @@
 |---|---------|--------|
 | 1 | Qué es un servidor PostgreSQL y levantarlo con Docker | ✅ |
 | 2 | `psql`: conectarse, roles, bases de datos y permisos | ✅ |
-| 3 | SQL básico: tablas, tipos, claves, CRUD | ⏳ en curso |
-| 4 | Relaciones: claves foráneas, JOINs, índices | ⬜ |
-| 5 | Proyecto Python: entorno virtual, dependencias, variables de entorno | ⬜ |
+| 3 | SQL básico: tablas, tipos, claves, CRUD | ✅ |
+| 4 | Relaciones: claves foráneas, JOINs, índices | ✅ |
+| 5 | Proyecto Python: entorno virtual, dependencias, variables de entorno | ⏳ en curso |
 | 6 | FastAPI: primer endpoint, rutas, Swagger (`/docs`) | ⬜ |
 | 7 | Conectar FastAPI con PostgreSQL (pool de conexiones) | ⬜ |
 | 8 | CRUD completo con Pydantic (validación de entrada/salida) | ⬜ |
@@ -769,7 +769,801 @@ filas ↓             ----+--------+----------------+--------
 > Esta validación gratis es una de las grandes ventajas de una BD relacional.
 
 Además del tipo, cada columna puede llevar **restricciones** (`PRIMARY KEY`,
-`NOT NULL`, `UNIQUE`, `DEFAULT`...). Las vemos en la siguiente sección.
+`NOT NULL`, `UNIQUE`, `DEFAULT`...). Las vemos en la sección 3.4.
+
+### 3.2 `INSERT` y cómo leer sus errores
+
+```sql
+INSERT INTO usuarios (id, nombre, email, activo) VALUES (1, 'Ana', 'ana@mail.com', true);
+--                    └──── columnas ─────────┘          └──── valores, MISMO orden ──┘
+```
+
+Respuesta: `INSERT 0 1` → el `1` = **filas insertadas**. (El `0` es un resto
+histórico, ignóralo.)
+
+Errores que salieron en el curso:
+
+| SQL | Error | Por qué |
+|---|---|---|
+| `VALUES (2, 'Juan', , true)` | `syntax error at or near ","` | No se puede dejar un hueco vacío entre comas |
+| `(id, nombre, email, activo) VALUES (2, 'Juan', true)` | `INSERT has more target columns than expressions` | 4 columnas pero 3 valores: tienen que coincidir |
+
+### 3.3 `NULL`: "no hay valor"
+
+Dos formas de dejar una columna sin valor:
+
+```sql
+INSERT INTO usuarios (id, nombre, activo) VALUES (2, 'Juan', true);               -- omitir la columna
+INSERT INTO usuarios (id, nombre, email, activo) VALUES (2, 'Juan', NULL, true);  -- NULL explícito
+```
+
+- `NULL` **no** es `''` (texto vacío) ni `0`: es **"desconocido / no hay dato"**.
+- Si omites una columna, recibe su `DEFAULT`; si no tiene, `NULL`. (Por eso
+  `creado_en` salió vacío en todas las filas.)
+- ⚠️ `psql` pinta `NULL` como **un hueco en blanco**, igual que `''`. Para distinguirlos:
+  `\pset null '∅'` (dura hasta que salgas de `psql`).
+- ⚠️ Para buscar nulos **no** sirve `=`: `WHERE email = NULL` no devuelve nada nunca.
+  Se usa `WHERE email IS NULL` / `IS NOT NULL`.
+- En la API (JSON), `NULL` de Postgres se convierte en `null`, y `None` en Python.
+
+### 3.4 Restricciones (constraints): que la tabla se defienda sola
+
+**El problema** (lo que pasó en el curso): sin restricciones, la tabla aceptó
+**tres usuarios con `id = 2`** y uno **sin email**. Si la API recibe
+`GET /usuarios/2`, ¿cuál devuelve? Encuentra 3 filas cuando esperaba 1 → o
+devuelve uno al azar o falla. **Los datos basura acaban siendo bugs en la API.**
+
+> 💡 **Regla de oro:** las reglas de los datos se ponen **en la base de datos**,
+> no solo en la API. La API puede tener fallos, puede haber otra app escribiendo
+> en la misma BD, o alguien puede meter datos a mano. La BD es la última defensa.
+
+| Restricción | Qué garantiza |
+|---|---|
+| `NOT NULL` | La columna **siempre** tiene valor |
+| `UNIQUE` | No hay dos filas con el mismo valor en esa columna (los `NULL` sí se pueden repetir) |
+| `PRIMARY KEY` | El **identificador** de la fila: = `NOT NULL` + `UNIQUE` (y crea un índice). **Solo una por tabla** |
+| `DEFAULT valor` | Valor que se pone si no le das uno al insertar |
+| `CHECK (condición)` | Cualquier regla: `CHECK (precio >= 0)`, `CHECK (edad BETWEEN 0 AND 150)` |
+
+**Ids automáticos.** No queremos inventarnos el `id` a mano (¿cuál era el
+siguiente libre?). Postgres lo genera:
+
+```sql
+id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY
+```
+
+- `GENERATED ALWAYS AS IDENTITY` → Postgres lleva un contador interno (1, 2, 3...).
+- `ALWAYS` → **no** te deja poner el id a mano (error si lo intentas).
+  `BY DEFAULT` sí te dejaría.
+- Verás mucho `id SERIAL PRIMARY KEY` en código antiguo y tutoriales: es la forma
+  vieja de hacer lo mismo. Si el servidor del trabajo lo usa, funciona igual.
+- Los ids **no se reutilizan**: si borras el 3, el siguiente sigue siendo el 4.
+  Y si un `INSERT` falla, ese número también se pierde. Los huecos son normales.
+
+**Fechas automáticas:** `creado_en timestamptz NOT NULL DEFAULT now()`.
+
+**Dónde se escriben.** Detrás del tipo de cada columna, separadas por
+**espacios** (no comas), en cualquier orden:
+
+```
+nombre_columna  TIPO  RESTRICCIÓN  RESTRICCIÓN  ...  ,
+```
+
+Ejemplo con otra tabla:
+
+```sql
+CREATE TABLE productos (
+    codigo     text          PRIMARY KEY,
+    nombre     text          NOT NULL,
+    precio     numeric(10,2) NOT NULL CHECK (precio >= 0),
+    stock      int           NOT NULL DEFAULT 0,
+    sku        text          UNIQUE
+);
+```
+
+- La **coma** separa **columnas**; los **espacios** separan las restricciones de una misma columna.
+- `stock` → si no le das valor en el `INSERT`, vale `0`; y nunca puede ser `NULL`.
+- `sku` → `UNIQUE` sin `NOT NULL`: puede quedar vacío, pero si se rellena no puede repetirse.
+
+**Restricciones de tabla** (al final, como si fueran una "columna" más). Se usan
+cuando la regla afecta a **varias columnas** a la vez:
+
+```sql
+CREATE TABLE notas (
+    alumno_id  int  NOT NULL,
+    asignatura text NOT NULL,
+    nota       numeric(4,2),
+    UNIQUE (alumno_id, asignatura)          -- un alumno, una nota por asignatura
+);
+```
+
+**Ponerles nombre** (opcional, pero hace los errores más legibles):
+
+```sql
+precio numeric(10,2) CONSTRAINT precio_positivo CHECK (precio >= 0)
+```
+
+Sin nombre, Postgres se inventa uno (p. ej. `productos_precio_check`), que es lo
+que verás en los mensajes de error.
+
+**Ver las restricciones de una tabla:** `\d nombre_tabla` (abajo, en *Indexes*
+y *Check constraints*).
+
+**Ejercicio del curso: la tabla `usuarios` con restricciones**
+
+```sql
+CREATE TABLE usuarios (
+    id        int         GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    nombre    text        NOT NULL,
+    email     text        NOT NULL UNIQUE,
+    activo    boolean     NOT NULL DEFAULT true,
+    creado_en timestamptz NOT NULL DEFAULT now()
+);
+```
+
+> ⚠️ **`DEFAULT` no impide `NULL`.** `DEFAULT` solo actúa cuando **omites** la
+> columna. Si alguien manda `NULL` a propósito (`VALUES ('Ana', 'a@a.com', NULL)`),
+> se guarda `NULL`. Para prohibirlo, `DEFAULT` + `NOT NULL` juntos.
+> (Error que cometí: puse `activo boolean DEFAULT true` sin `NOT NULL`.)
+
+**Intentos de romperla y sus errores:**
+
+| Intento | Error |
+|---|---|
+| Email repetido | `duplicate key value violates unique constraint "usuarios_email_key"` |
+| Sin email | `null value in column "email" ... violates not-null constraint` |
+| `id` a mano | `cannot insert a non-DEFAULT value into column "id"` (por el `ALWAYS`) |
+
+**Anatomía de un error de Postgres:**
+
+```
+ERROR:  duplicate key value violates unique constraint "usuarios_email_key"   ← qué regla se rompió
+DETAIL:  Key (email)=(ana@mail.com) already exists.                          ← con qué dato
+HINT:  ...                                                                    ← (a veces) cómo solucionarlo
+```
+
+- `usuarios_email_key` es el nombre que Postgres le puso al `UNIQUE` (tabla_columna_key).
+- 💡 **Estos errores son los que tu API tendrá que traducir a HTTP**: un email
+  repetido no es un "error 500 del servidor", es un **409 Conflict** ("ese email ya existe").
+  Lo veremos en la lección 9.
+
+**Los ids que se "pierden":** en el `DETAIL` del error de "sin email" se ve
+`Failing row contains (3, Anuel, null, ...)`. Postgres **ya había gastado el id 3**
+antes de comprobar las restricciones (y el 2 en el intento del email repetido).
+Los ids del contador se reparten **antes** de validar, y no se devuelven. Por eso
+los huecos en los ids son normales y nunca hay que usarlos para contar filas.
+
+### 3.6 Modificar una tabla que ya existe: `ALTER TABLE`
+
+En el mundo real **no** puedes hacer `DROP TABLE` y volver a crearla: tiene datos.
+
+```sql
+ALTER TABLE usuarios ALTER COLUMN activo SET NOT NULL;      -- añadir NOT NULL
+ALTER TABLE usuarios ALTER COLUMN activo DROP NOT NULL;     -- quitarlo
+ALTER TABLE usuarios ALTER COLUMN activo SET DEFAULT true;  -- cambiar el default
+ALTER TABLE usuarios ADD COLUMN telefono text;              -- añadir columna
+ALTER TABLE usuarios DROP COLUMN telefono;                  -- borrar columna (¡y sus datos!)
+ALTER TABLE usuarios RENAME COLUMN nombre TO nombre_completo;
+ALTER TABLE usuarios ADD CONSTRAINT email_con_arroba CHECK (email LIKE '%@%');
+```
+
+> ⚠️ Si añades una restricción y **ya hay filas que no la cumplen**, el `ALTER`
+> falla. Primero hay que arreglar los datos.
+
+### 3.7 Fechas y horas
+
+| Tipo | Guarda | Ejemplo |
+|---|---|---|
+| `date` | Solo fecha | `'2026-11-12'` |
+| `time` | Solo hora | `'14:30:00'` |
+| `timestamp` | Fecha + hora **sin** zona horaria | `'2026-11-12 14:30:00'` |
+| `timestamptz` | Fecha + hora **con** zona horaria | `'2026-11-12 14:30:00+01'` |
+
+**Usa siempre `timestamptz`** para "cuándo pasó algo" (creado, modificado, pedido...):
+
+- `timestamp` guarda `14:30` sin más: ¿14:30 de Madrid? ¿de Londres? ¿UTC? No se sabe.
+- `timestamptz` convierte a **UTC** al guardar y te lo muestra en tu zona al leer.
+  Mismo instante para todos, estén donde estén el servidor, la API o el usuario.
+- (El nombre engaña: `timestamptz` **no guarda** la zona, guarda el instante exacto en UTC.)
+
+**Obtener la fecha/hora actual:**
+
+```sql
+SELECT now();               -- fecha y hora actual (timestamptz)
+SELECT current_date;        -- solo la fecha de hoy
+SHOW timezone;              -- zona horaria de la sesión (en Docker: UTC)
+```
+
+> 💡 `now()` devuelve la hora de **inicio de la transacción**: si insertas 100
+> filas en la misma transacción, todas tendrán exactamente la misma hora.
+
+**Escribir una fecha a mano:** como texto entre comillas simples en formato
+**ISO** `AAAA-MM-DD HH:MM:SS`, y Postgres lo convierte:
+
+```sql
+INSERT INTO eventos (nombre, cuando) VALUES ('Reunión', '2026-11-12 09:00:00+01');
+SELECT * FROM eventos WHERE cuando >= '2026-11-01';   -- comparar fechas
+SELECT now() - interval '7 days';                     -- hace una semana
+```
+
+**Borrar una tabla:** `DROP TABLE nombre;` ⚠️ Borra la tabla **y todos sus
+datos**, sin papelera y sin preguntar.
+
+### 3.8 CRUD: las 4 operaciones que hará tu API
+
+| CRUD | SQL | Endpoint típico |
+|---|---|---|
+| **C**reate | `INSERT` | `POST /usuarios` |
+| **R**ead | `SELECT` | `GET /usuarios`, `GET /usuarios/4` |
+| **U**pdate | `UPDATE` | `PUT` / `PATCH /usuarios/4` |
+| **D**elete | `DELETE` | `DELETE /usuarios/4` |
+
+**INSERT de varias filas a la vez:**
+
+```sql
+INSERT INTO usuarios (nombre, email) VALUES
+    ('Luis', 'luis@mail.com'),
+    ('Marta', 'marta@mail.com');
+```
+
+**SELECT:**
+
+```sql
+SELECT * FROM usuarios;                                  -- todo (evítalo en la API: pide solo lo que necesites)
+SELECT id, nombre FROM usuarios;                         -- solo algunas columnas
+SELECT * FROM usuarios WHERE id = 4;                     -- filtrar
+SELECT * FROM usuarios WHERE activo AND nombre LIKE 'A%';-- varias condiciones; LIKE: % = "lo que sea"
+SELECT * FROM usuarios WHERE nombre ILIKE '%ana%';       -- ILIKE = LIKE sin distinguir mayúsculas
+SELECT * FROM usuarios ORDER BY creado_en DESC;          -- ordenar (DESC = de mayor a menor)
+SELECT * FROM usuarios ORDER BY id LIMIT 10 OFFSET 20;   -- paginar: 10 filas saltándose las 20 primeras
+SELECT count(*) FROM usuarios;                           -- contar
+```
+
+> ⚠️ **Sin `ORDER BY`, el orden de las filas NO está garantizado.** Hoy pueden salir
+> ordenadas por casualidad y mañana no. Si el orden importa (paginación), ponlo siempre.
+
+**UPDATE:**
+
+```sql
+UPDATE usuarios SET activo = false WHERE id = 4;
+UPDATE usuarios SET nombre = 'Ana María', email = 'anamaria@mail.com' WHERE id = 1;
+```
+
+**DELETE:**
+
+```sql
+DELETE FROM usuarios WHERE id = 4;
+```
+
+> 🚨 **`UPDATE` y `DELETE` sin `WHERE` afectan a TODAS las filas.**
+> `DELETE FROM usuarios;` borra todos los usuarios, sin preguntar.
+> Respuesta de Postgres: `DELETE 2` / `UPDATE 1` → **cuántas filas** ha tocado.
+> Si esperabas 1 y pone 5000, algo va mal.
+
+**`RETURNING`: que el `INSERT`/`UPDATE`/`DELETE` te devuelva las filas afectadas**
+
+```sql
+INSERT INTO usuarios (nombre, email) VALUES ('Eva', 'eva@mail.com') RETURNING *;
+UPDATE usuarios SET activo = false WHERE id = 5 RETURNING id, activo;
+DELETE FROM usuarios WHERE id = 5 RETURNING *;
+```
+
+💡 **Clave para la API:** un `POST /usuarios` debe responder con el usuario creado,
+**incluido su `id` y `creado_en`**, que los ha generado Postgres. Con `RETURNING`
+lo obtienes en la misma consulta, sin hacer un `SELECT` después.
+
+### 3.9 Transacciones: la red de seguridad
+
+```sql
+BEGIN;                                   -- empieza una transacción
+UPDATE usuarios SET activo = false;      -- ups, sin WHERE → "UPDATE 3"
+SELECT * FROM usuarios;                  -- compruebas el desastre (solo lo ves tú)
+ROLLBACK;                                -- deshace TODO desde el BEGIN
+-- o COMMIT;                             -- confirma y guarda de verdad
+```
+
+- Mientras no hagas `COMMIT`, los cambios **solo los ves tú**; el resto de
+  conexiones (y tu API) siguen viendo los datos de antes.
+- Si algo falla dentro de la transacción, Postgres la marca como rota y hay que hacer `ROLLBACK`.
+- En `psql`, sin `BEGIN`, cada sentencia se confirma sola al momento (*autocommit*).
+- También sirve para que **varias operaciones se hagan todas o ninguna** (p. ej.
+  restar dinero de una cuenta y sumarlo en otra).
+
+**Lo que se vio en el ejercicio:**
+
+```
+curso=# BEGIN;
+curso=*# DELETE FROM usuarios;     ← el * del prompt = estás DENTRO de una transacción abierta
+DELETE 4
+curso=*# ROLLBACK;
+curso=#                            ← sin * = transacción cerrada
+```
+
+- Luis y Marta, insertados en el **mismo** `INSERT`, tienen **exactamente** el mismo
+  `creado_en`: `now()` da la hora de inicio de la transacción, no la de cada fila.
+- `ILIKE 'a%'` y `ILIKE 'A%'` dan lo mismo (no distingue mayúsculas). Con `LIKE`, `'a%'` no encontraría a "Ana".
+- `ORDER BY name` → `column "name" does not exist`: el `^` del error apunta justo a la palabra mal escrita.
+- En `psql` el **TAB** autocompleta palabras de SQL, nombres de tablas y columnas.
+
+**Experimento con dos terminales:** A hace `BEGIN; DELETE FROM usuarios;` (sin
+confirmar) y B hace `SELECT * FROM usuarios;` → B ve **las 4 filas**. Lo no
+confirmado es invisible para los demás. (Trampa 2: B necesita `SELECT` sobre
+`usuarios`; sin `GRANT` le habría dado `permission denied`.)
+
+### 3.10 Cómo lo hace Postgres por dentro: MVCC
+
+Modelo intuitivo (pero **incorrecto**): "tras el `BEGIN` los cambios se guardan
+en RAM en una copia, `ROLLBACK` los tira y al confirmar se escriben al disco".
+
+Cómo funciona de verdad (**MVCC**, *Multi-Version Concurrency Control*):
+
+1. Cada transacción tiene un **número** (id de transacción).
+2. Un `DELETE` **no borra** la fila: le pone una marca *"borrada por la transacción 750"*.
+   Un `UPDATE` no modifica: marca la fila vieja como borrada y **crea una versión nueva**.
+3. Esos cambios se escriben como cualquier otro (a memoria compartida y al **WAL**,
+   el diario en disco). **No** esperan al final.
+4. Cada consulta mira una **foto** (*snapshot*) de qué transacciones estaban
+   confirmadas cuando empezó. La marca "borrada por la 750" solo cuenta si la 750
+   está **confirmada**. Para B no lo estaba → seguía viendo las filas.
+5. **`COMMIT`** (no `BEGIN`) apunta "la 750 está confirmada" → desde ese momento las marcas cuentan para todos.
+   **`ROLLBACK`** apunta "la 750 se abortó" → sus marcas se ignoran para siempre. No hay que deshacer nada,
+   por eso `ROLLBACK` es instantáneo aunque hayas borrado un millón de filas.
+6. Más tarde, un proceso de limpieza (**`VACUUM`**, automático) recoge las versiones
+   que ya nadie puede ver y libera el espacio.
+
+> 💡 Consecuencia práctica: **los lectores no bloquean a los escritores ni al
+> revés**. Tu API puede estar haciendo `SELECT` mientras otro proceso hace `UPDATE`
+> sin esperarse. Lo que sí se bloquea: **dos escrituras sobre la misma fila**;
+> la segunda espera a que la primera haga `COMMIT`/`ROLLBACK`.
+>
+> ⚠️ Por eso una transacción olvidada abierta (`curso=*#`) en un servidor real es
+> peligrosa: bloquea a cualquiera que quiera modificar esas filas.
+
+> 💡 **Hábito para el trabajo:** antes de un `UPDATE`/`DELETE` a mano en un
+> servidor con datos reales: `BEGIN;` → la sentencia → mira el número de filas →
+> `COMMIT;` solo si cuadra.
+
+---
+
+## Lección 4 — Relaciones: claves foráneas, JOINs, índices
+
+### 4.1 Por qué separar en varias tablas
+
+Mala idea: guardar el autor dentro de cada libro.
+
+```
+ titulo            | autor_nombre | autor_pais
+-------------------+--------------+-----------
+ Cien años...      | G. Márquez   | Colombia
+ El amor en...     | G. Marquez   | Colombia     ← ¿es el mismo? alguien lo escribió sin tilde
+ Crónica de...     | G. Márquez   | Colmbia      ← errata: ahora hay 3 versiones del mismo dato
+```
+
+Buena idea: cada cosa en **su tabla**, y se **referencian por id**:
+
+```
+autores                         libros
+ id | nombre     | pais          id | titulo        | autor_id
+----+------------+---------     ----+---------------+----------
+  1 | G. Márquez | Colombia       1 | Cien años...  |        1   ─┐
+                                  2 | El amor en... |        1   ─┼─▶ todos apuntan al autor 1
+                                  3 | Crónica de... |        1   ─┘
+```
+
+- El dato del autor está en **un solo sitio**: si lo corriges, se corrige para todos sus libros.
+- Esto es una relación **uno a muchos (1:N)**: un autor tiene muchos libros; un libro, un autor.
+- La columna `autor_id` va en el lado de los **"muchos"** (`libros`).
+
+### 4.2 Clave foránea (FOREIGN KEY)
+
+Una **clave foránea** es una columna que **apunta a la clave primaria de otra
+tabla**, y Postgres **garantiza** que lo que apunta existe.
+
+```sql
+CREATE TABLE autores (
+    id     int  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    nombre text NOT NULL
+);
+
+CREATE TABLE libros (
+    id       int  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    titulo   text NOT NULL,
+    autor_id int  NOT NULL REFERENCES autores (id)
+    --                     ^^^^^^^^^^^^^^^^^^^^^^^ clave foránea
+);
+```
+
+- El **tipo** de la columna tiene que coincidir con el de la clave primaria a la que apunta (`int` → `int`).
+- Convención de nombres: `<tabla_en_singular>_id` → `autor_id`, `usuario_id`.
+- `NOT NULL` → todo libro **tiene** que tener autor. Sin él, el libro podría quedar "huérfano" (con `autor_id` a `NULL`).
+
+**Qué impide:**
+
+| Intento | Resultado |
+|---|---|
+| Insertar un libro con `autor_id = 999` (no existe) | `ERROR: insert or update on table "libros" violates foreign key constraint` |
+| Borrar un autor que tiene libros | `ERROR: update or delete on table "autores" violates foreign key constraint ... is still referenced` |
+
+**¿Qué hacer al borrar el "padre"?** Se decide con `ON DELETE`:
+
+```sql
+autor_id int NOT NULL REFERENCES autores (id) ON DELETE CASCADE
+```
+
+| Opción | Al borrar el autor... | Cuándo usarla |
+|---|---|---|
+| *(nada)* / `RESTRICT` | Error si tiene libros | **Por defecto y lo más seguro** |
+| `CASCADE` | Se borran **también** todos sus libros | Cuando los hijos no tienen sentido sin el padre (líneas de un pedido) |
+| `SET NULL` | Sus libros quedan con `autor_id = NULL` | Cuando el hijo puede vivir sin padre (requiere que la columna admita `NULL`) |
+
+> ⚠️ `CASCADE` es cómodo y peligroso: un `DELETE` de una fila puede borrar
+> miles en otras tablas sin avisar. En el trabajo, antes de borrar algo,
+> mira con `\d tabla` si otras tablas apuntan a ella (sección *Referenced by*).
+
+### 4.3 JOIN: consultar varias tablas a la vez
+
+Un `JOIN` **une filas de dos tablas** según una condición (normalmente: la
+clave foránea de una = la clave primaria de la otra).
+
+```sql
+SELECT libros.titulo, autores.nombre
+FROM libros
+JOIN autores ON libros.autor_id = autores.id;
+--           ^^ la condición para emparejar filas
+```
+
+**Alias** para escribir menos (muy habitual):
+
+```sql
+SELECT l.titulo, a.nombre
+FROM libros l
+JOIN autores a ON l.autor_id = a.id
+WHERE a.nombre = 'G. Márquez'
+ORDER BY l.titulo;
+```
+
+> ⚠️ Si dos tablas tienen una columna con el **mismo nombre** (las dos tienen
+> `id`), hay que decir de cuál: `l.id` o `a.id`. Si no:
+> `ERROR: column reference "id" is ambiguous`.
+
+**Tipos de JOIN** (los dos que usarás el 99 % del tiempo):
+
+| JOIN | Devuelve | Ejemplo |
+|---|---|---|
+| `JOIN` (= `INNER JOIN`) | Solo las filas que **tienen pareja** en las dos tablas | Libros con su autor |
+| `LEFT JOIN` | **Todas** las filas de la tabla de la izquierda, tengan pareja o no. Si no tienen, las columnas de la derecha salen `NULL` | Todos los autores, **también los que no tienen libros** |
+
+```
+autores: 1 Márquez, 2 Borges (sin libros)
+
+JOIN       → solo Márquez (con cada uno de sus libros)
+LEFT JOIN  → Márquez (con sus libros) + Borges con titulo = NULL
+```
+
+Truco clásico — "autores **sin** libros":
+
+```sql
+SELECT a.nombre
+FROM autores a
+LEFT JOIN libros l ON l.autor_id = a.id
+WHERE l.id IS NULL;
+```
+
+### 4.4 Agrupar: `GROUP BY`
+
+Para preguntas del tipo "**cuántos** / **cuánto** **por** cada X":
+
+```sql
+SELECT a.nombre, count(l.id) AS num_libros
+FROM autores a
+LEFT JOIN libros l ON l.autor_id = a.id
+GROUP BY a.id, a.nombre
+ORDER BY num_libros DESC;
+```
+
+- `GROUP BY` junta las filas que comparten valor → **una fila por grupo**.
+- Funciones de agregado: `count()`, `sum()`, `avg()`, `min()`, `max()`.
+- Regla: toda columna del `SELECT` que **no** esté dentro de una función de agregado
+  tiene que estar en el `GROUP BY`. Si no: `ERROR: column "..." must appear in the GROUP BY clause`.
+- `AS num_libros` → pone nombre a la columna del resultado (será la clave del JSON en la API).
+- `count(l.id)` y no `count(*)`: con `LEFT JOIN`, `count(*)` contaría 1 para un autor
+  sin libros (la fila con `NULL`); `count(l.id)` no cuenta los `NULL` → 0. ✔️
+- Para filtrar **grupos** (no filas) se usa `HAVING`: `... GROUP BY ... HAVING count(l.id) > 5`.
+
+### 4.5 Ejercicio del curso: `usuarios` ← `pedidos`
+
+```sql
+CREATE TABLE pedidos (
+    id         int           GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    usuario_id int           NOT NULL REFERENCES usuarios (id),
+    producto   text          NOT NULL,
+    importe    numeric(10,2) NOT NULL CHECK (importe >= 0),
+    creado_en  timestamptz   NOT NULL DEFAULT now()
+);
+```
+
+**Errores y lo que enseñan:**
+
+| SQL | Error | Lección |
+|---|---|---|
+| Pedido de `usuario_id = 999` | `violates foreign key constraint "pedidos_usuario_id_fkey"` / `Key (usuario_id)=(999) is not present in table "usuarios"` | La FK impide apuntar a algo que no existe |
+| `importe = -5` | `violates check constraint "pedidos_importe_check"` | El `CHECK` funciona |
+| Borrar a Ana (tiene pedidos) | `... is still referenced from table "pedidos"` | Sin `ON DELETE`, Postgres protege a los hijos |
+| `JOIN pedidos p;` (sin `ON`) | `syntax error at or near ";"` | Un `JOIN` necesita su condición `ON` |
+| `LEFT JOIN pedidos p WHERE u.id = ...` | `syntax error at or near "WHERE"` | La condición de emparejar va en `ON`, no en `WHERE` |
+| `GROUP BY` olvidado con `count()` | `column "u.nombre" must appear in the GROUP BY clause` | Columnas sin agregar → al `GROUP BY` |
+
+**El prompt `curso=!#`:** tras un error **dentro** de una transacción, el prompt
+pasa de `*` a `!` = **transacción rota**. Todo lo que escribas dará
+`current transaction is aborted, commands ignored until end of transaction block`.
+Única salida: `ROLLBACK;`.
+
+```
+curso=#    sin transacción
+curso=*#   transacción abierta, todo bien
+curso=!#   transacción abierta y ROTA → ROLLBACK
+```
+
+**`\d usuarios` → `Referenced by:`** aparece cuando otra tabla tiene una FK
+apuntando a esta. Antes de borrar filas o la tabla, mira esto.
+
+**`ON` vs `WHERE`:**
+- `ON` → **cómo emparejar** las filas de las dos tablas.
+- `WHERE` → **qué filas quedan** después de unirlas.
+- En el truco de "usuarios sin pedidos", el `WHERE p.id IS NULL` va **después**
+  del `LEFT JOIN`: se quedan las filas donde no hubo pareja.
+
+**`GROUP BY u.id` vs `GROUP BY u.nombre`** (los dos funcionaron):
+- `GROUP BY u.id` ✅ → como `id` es la clave primaria, Postgres sabe que cada id
+  tiene un único nombre, así que deja usar `u.nombre` en el `SELECT`.
+- `GROUP BY u.nombre` ❌ peligroso → si hay **dos usuarios** llamados "Ana",
+  los mezcla en **un solo grupo** y suma sus pedidos. Funciona hoy por casualidad.
+  **Agrupa siempre por el id.**
+
+**`SELECT *` con JOIN:** el resultado tiene **dos columnas `id`** y **dos
+`creado_en`**. En la API, al convertirlo a JSON, una pisaría a la otra.
+**Con JOIN, nombra siempre las columnas:** `u.id AS usuario_id, p.id AS pedido_id`.
+
+**`sum()` de nada es `NULL`, no `0`** → `coalesce`:
+
+```sql
+SELECT u.nombre,
+       count(p.id)                 AS num_pedidos,
+       coalesce(sum(p.importe), 0) AS total_gastado
+FROM usuarios u
+LEFT JOIN pedidos p ON u.id = p.usuario_id
+GROUP BY u.id, u.nombre
+ORDER BY total_gastado DESC;
+```
+
+- Sin pedidos, `sum(p.importe)` suma cero filas → `NULL`. (`count` en cambio da `0`.)
+- `coalesce(a, b, ...)` → devuelve **el primero que no sea `NULL`**.
+- Sin `coalesce`, la API mandaría `"total_gastado": null` y el frontend pintaría "Has gastado null €".
+- Además, en `ORDER BY ... DESC` los `NULL` salen **los primeros**: Marta y
+  Anuel aparecerían arriba del ranking de gasto. (Se puede controlar con `NULLS LAST`.)
+
+**Buffer de `psql`:** si el prompt se queda en `curso-#` es que hay texto a medias
+esperando un `;`. Para descartarlo: **Ctrl+C** o `\r` (*reset*). Ver qué hay: `\p`.
+
+### 4.6 Índices
+
+Sin índice, para encontrar `WHERE usuario_id = 5` Postgres lee **la tabla entera**,
+fila a fila (*Sequential Scan*). Con 4 filas no importa; con 10 millones, sí.
+
+Un **índice** es como el índice alfabético de un libro: una estructura aparte
+(un árbol **B-tree**, ordenado) que dice "el valor 5 está en estas filas", sin
+leerlo todo.
+
+```sql
+CREATE INDEX nombre_indice ON tabla (columna);
+CREATE INDEX pedidos_usuario_id_idx ON pedidos (usuario_id);   -- convención: tabla_columna_idx
+DROP INDEX nombre_indice;
+```
+
+**Cuáles crea Postgres solo y cuáles no:**
+
+| Restricción | ¿Crea índice? |
+|---|---|
+| `PRIMARY KEY` | ✅ Sí (`usuarios_pkey`) |
+| `UNIQUE` | ✅ Sí (`usuarios_email_key`); lo necesita para comprobar duplicados rápido |
+| `REFERENCES` (clave foránea) | ❌ **NO**. Hay que crearlo a mano |
+
+> 💡 **Regla práctica: crea un índice en cada columna de clave foránea.** Se usan
+> en casi todos los `JOIN` y `WHERE` ("pedidos del usuario 5"), y además Postgres
+> los necesita para comprobar rápido si puede borrar un usuario (¿tiene pedidos?).
+
+**Qué columnas indexar:** las que aparecen mucho en `WHERE`, `JOIN ... ON` y
+`ORDER BY`. **No** indexes todo: cada índice ocupa espacio y **hace más lentos
+los `INSERT`/`UPDATE`/`DELETE`** (hay que actualizar la tabla y todos sus índices).
+
+**`EXPLAIN`: ¿cómo va a ejecutar Postgres mi consulta?**
+
+```sql
+EXPLAIN SELECT * FROM pedidos WHERE usuario_id = 5;
+--  Seq Scan on pedidos ...                  ← lee toda la tabla
+--  Index Scan using pedidos_usuario_id_idx  ← usa el índice
+EXPLAIN ANALYZE SELECT ...;                  -- la ejecuta de verdad y da tiempos reales
+```
+
+> ⚠️ En tablas **pequeñas** Postgres hace `Seq Scan` **aunque haya índice**: leer
+> 3 filas seguidas es más rápido que consultar un índice y luego saltar a la tabla.
+> El *planificador* decide según el tamaño de la tabla. Que salga `Seq Scan` en tu
+> tabla de prueba **no** significa que el índice esté mal.
+
+**Lo que pasó en el curso:**
+
+```
+-- ANTES del índice
+Seq Scan on pedidos  (cost=0.00..21.00 rows=4 width=64)
+-- DESPUÉS del índice
+Seq Scan on pedidos  (cost=0.00..1.04 rows=1 width=64)
+```
+
+Cómo leer la línea del plan:
+- `Seq Scan` / `Index Scan` → **cómo** va a leer. **Esto es lo importante**, y no cambió: el índice **no se usó**.
+- `cost=inicio..total` → coste **estimado** en unidades inventadas por Postgres (no son ms). Solo sirve para comparar planes.
+- `rows=` → cuántas filas **cree que va a devolver** (una estimación), **no** cuántas ha mirado.
+- `width=` → tamaño medio estimado de cada fila en bytes.
+
+¿Por qué cambiaron `cost` y `rows` si el plan es el mismo? Porque son
+**estimaciones**, y dependen de las **estadísticas** que Postgres tiene de la
+tabla. Antes, la tabla era recién creada y no tenía estadísticas: Postgres
+suponía una tabla de tamaño "por defecto". `CREATE INDEX` recorre la tabla
+entera y, de paso, actualiza las estadísticas: "esta tabla tiene 3 filas en 1
+página". Con esos datos reales, la estimación baja. (Las estadísticas también
+se actualizan con `ANALYZE pedidos;` y con el *autovacuum*.)
+
+Para **ver** el índice en acción en una tabla pequeña (solo para aprender, **nunca** en producción):
+
+```sql
+SET enable_seqscan = off;     -- "prohíbe" el Seq Scan en esta sesión
+EXPLAIN SELECT * FROM pedidos WHERE usuario_id = 5;
+RESET enable_seqscan;
+```
+
+**¿Por qué no indexar todas las columnas?**
+1. **Espacio**: cada índice es una estructura aparte que ocupa disco y memoria.
+2. **Escrituras más lentas** (el motivo principal): cada `INSERT`/`UPDATE`/`DELETE`
+   tiene que actualizar la tabla **y cada uno de sus índices**. 10 índices = 11 escrituras.
+3. Un índice que no se usa en ninguna consulta es coste sin beneficio.
+
+**Nombres de índices:** son únicos **por schema**, no por tabla. Por eso la
+convención incluye la tabla: `pedidos_usuario_id_idx`. Si se llamara
+`usuario_id_idx` y mañana `facturas` también tuviera `usuario_id`, chocarían.
+
+```sql
+ALTER INDEX usuario_id_idx RENAME TO pedidos_usuario_id_idx;
+```
+
+---
+
+## Lección 5 — Proyecto Python: entorno virtual, dependencias, variables de entorno
+
+### 5.1 Entorno virtual (`venv`)
+
+**Problema:** si instalas librerías con `pip` "a lo global", todos tus proyectos
+comparten las mismas versiones. El proyecto A necesita FastAPI 0.100 y el B la
+0.115 → conflicto. Además, Ubuntu 24.04 directamente **no te deja** instalar
+con `pip` en el Python del sistema (`error: externally-managed-environment`).
+
+**Solución:** un **entorno virtual** = una carpeta con **su propio** Python y
+**sus propias** librerías, solo para este proyecto.
+
+```bash
+python3 -m venv .venv          # crea el entorno en la carpeta .venv
+source .venv/bin/activate      # lo ACTIVA en esta terminal → el prompt empieza por (.venv)
+which python                   # comprobar: debe apuntar a .../curso-servidores/.venv/bin/python
+deactivate                     # salir del entorno
+```
+
+- `python3 -m venv` → "ejecuta el módulo `venv` de Python".
+- `.venv` es el nombre de la carpeta (convención; el punto la oculta en `ls`).
+- **Hay que activarlo en cada terminal nueva.** Si `pip install` o `python` se
+  comportan raro, lo primero: ¿sale `(.venv)` en el prompt?
+- La carpeta `.venv` **no se sube a git** (pesa mucho y es específica de tu máquina).
+  Se sube la **lista** de dependencias y cada uno se crea su entorno.
+
+### 5.2 Dependencias
+
+Con el entorno activado:
+
+```bash
+pip install "fastapi[standard]" "psycopg[binary,pool]"
+```
+
+| Paquete | Qué es |
+|---|---|
+| `fastapi` | El framework para crear la API |
+| `[standard]` | "Extras": añade `uvicorn` (el **servidor** que ejecuta la API), el comando `fastapi`, etc. |
+| `psycopg` | El **driver**: la librería que habla el protocolo de Postgres desde Python (versión 3) |
+| `[binary]` | Trae ya compilada la parte en C (si no, necesitarías tener instalado `libpq`) |
+| `[pool]` | *Pool* de conexiones (lección 7) |
+
+> ⚠️ Las comillas en `"fastapi[standard]"` son necesarias: sin ellas, bash
+> interpreta los corchetes `[]` como un patrón de ficheros.
+>
+> ⚠️ `psycopg2` (con 2) es la versión **antigua**, todavía muy extendida. Si
+> en el trabajo veis `import psycopg2`, es la misma idea con otra API. Nosotros: `psycopg` (3).
+
+**Guardar la lista de dependencias** para que otro (o tú en el portátil) pueda reproducir el entorno:
+
+```bash
+pip freeze > requirements.txt          # vuelca TODAS las librerías instaladas con su versión exacta
+pip install -r requirements.txt        # instalar desde la lista (en otra máquina)
+```
+
+### 5.3 Variables de entorno y `.env`: **nunca** contraseñas en el código
+
+❌ Mal:
+
+```python
+conn = psycopg.connect("postgresql://api_curso:api1234@localhost:5432/curso")
+```
+
+- En cuanto haces `git push`, **la contraseña está en GitHub**. Y aunque la borres
+  después, sigue en el **historial** de git. Hay bots que escanean GitHub buscando contraseñas.
+- Cada entorno (tu PC, pruebas, producción) usa una BD distinta → tendrías que tocar el código.
+
+✅ Bien: la configuración vive en **variables de entorno**, y el código las lee.
+
+**Variable de entorno** = un valor con nombre que el sistema operativo le pasa
+a cada programa que arranca (como el `-e` de Docker, que ya usamos):
+
+```bash
+export DATABASE_URL="postgresql://..."   # definirla en esta terminal
+echo $DATABASE_URL                       # verla
+```
+
+```python
+import os
+url = os.environ["DATABASE_URL"]         # leerla desde Python (error si no existe)
+url = os.getenv("DATABASE_URL")          # igual, pero devuelve None si no existe
+```
+
+**Fichero `.env`:** para no tener que hacer `export` cada vez, se escriben en un fichero:
+
+```bash
+# .env
+DATABASE_URL=postgresql://usuario:contraseña@localhost:5432/curso
+```
+
+y una librería (o FastAPI, lo veremos) lo carga al arrancar.
+
+**`.gitignore`:** fichero que le dice a git **qué no subir nunca**:
+
+```gitignore
+.venv/
+.env
+__pycache__/
+```
+
+> 💡 Convención: se sube un **`.env.example`** con las mismas claves pero valores
+> de mentira. Así quien clone el repo sabe qué variables tiene que rellenar.
+>
+> ```bash
+> # .env.example
+> DATABASE_URL=postgresql://USUARIO:CONTRASEÑA@localhost:5432/curso
+> ```
+
+### 5.4 Primera conexión desde Python con `psycopg`
+
+Piezas (para montar tu script):
+
+```python
+import psycopg
+
+with psycopg.connect(url) as conn:          # abre la conexión (y la cierra al salir del with)
+    with conn.cursor() as cur:              # el "cursor" es por donde mandas SQL y recibes filas
+        cur.execute("SELECT ...")           # manda el SQL
+        fila = cur.fetchone()               # recoge UNA fila → tupla, p. ej. (1, 'Ana')
+        filas = cur.fetchall()              # recoge TODAS → lista de tuplas
+```
+
+- `with` → se asegura de cerrar la conexión aunque haya un error.
+- Al salir del `with` de la conexión, psycopg hace **`COMMIT`** si todo fue bien
+  y **`ROLLBACK`** si hubo una excepción. Es decir: en Python, **cada conexión
+  trabaja dentro de una transacción** (lo contrario que `psql`, que hace autocommit).
+  Si haces un `INSERT` y no se confirma, no se guarda.
 
 ---
 
