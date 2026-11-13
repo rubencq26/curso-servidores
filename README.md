@@ -1565,6 +1565,29 @@ with psycopg.connect(url) as conn:          # abre la conexión (y la cierra al 
   trabaja dentro de una transacción** (lo contrario que `psql`, que hace autocommit).
   Si haces un `INSERT` y no se confirma, no se guarda.
 
+### 5.5 Lecciones de la revisión de código
+
+**`os.getenv` vs `os.environ[...]` → falla pronto y claro (*fail fast*):**
+
+```python
+url = os.getenv("DATABASE_URL")     # si falta → None → psycopg intenta conectar "por defecto"
+                                    #   (socket local, usuario de Linux...) → error confuso y lejos de la causa
+url = os.environ["DATABASE_URL"]    # si falta → KeyError: 'DATABASE_URL' → sabes al instante qué pasa
+```
+
+Para configuración **obligatoria**, que reviente en la primera línea con un
+error que diga exactamente qué falta. `getenv` es para cosas **opcionales**
+con valor por defecto: `os.getenv("PUERTO", "8000")`.
+
+**El usuario de la API solo ve lo que se le ha dado:** `api_curso` tiene
+`SELECT` en `usuarios`, pero **no** en `pedidos` → `permission denied for table pedidos`.
+Lo del `\dp` de la lección 2 aplica igual desde Python.
+
+**`.env` / `.env.example` / `.gitignore`:**
+- `.env.example` con un **ejemplo del formato**, no vacío: quien clone el repo tiene que saber qué poner.
+- Añadir `__pycache__/` al `.gitignore` **antes** de que aparezca (Python lo crea al importar módulos).
+- Comprobar que git ignora un fichero: `git check-ignore -v .env`.
+
 ---
 
 ## Anexo: problemas del entorno (WSL + Docker Desktop)
