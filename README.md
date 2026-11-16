@@ -15,7 +15,7 @@
 | 2 | `psql`: conectarse, roles, bases de datos y permisos | ✅ |
 | 3 | SQL básico: tablas, tipos, claves, CRUD | ✅ |
 | 4 | Relaciones: claves foráneas, JOINs, índices | ✅ |
-| 5 | Proyecto Python: entorno virtual, dependencias, variables de entorno | ⏳ en curso |
+| 5 | Proyecto Python: entorno virtual, dependencias, variables de entorno | ✅ |
 | 6 | FastAPI: primer endpoint, rutas, Swagger (`/docs`) | ⬜ |
 | 7 | Conectar FastAPI con PostgreSQL (pool de conexiones) | ⬜ |
 | 8 | CRUD completo con Pydantic (validación de entrada/salida) | ⬜ |
@@ -305,6 +305,26 @@ docker exec -it curso-postgres psql -U postgres -d curso
 El prompt cambia a `curso=#`:
 - `curso` → la base de datos en la que estás
 - `#` → eres **superusuario** (un usuario normal ve `>`)
+
+**Error típico: URL mal escrita.**
+
+```bash
+docker exec -it curso-postgres psql postregsql://api_curso:api1234@localhost:5432/curso
+#                                   ^^^^^^^^^^ errata
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed:
+FATAL:  role "root" does not exist
+```
+
+`psql` solo reconoce una URL si empieza **exactamente** por `postgresql://` o
+`postgres://`. Si no, toma ese texto como el **nombre de una base de datos** y
+usa los valores por defecto para todo lo demás. El error lo delata:
+- `on socket` → no ha ido a `localhost` por red: **ha ignorado el host** de la URL.
+- `role "root"` → no ha usado `api_curso`: ha usado el usuario del sistema
+  operativo. `docker exec` ejecuta como `root` dentro del contenedor.
+
+> 💡 Cuando un error menciona un usuario, host o puerto que **tú no has puesto**,
+> es que tu configuración **no se está leyendo**. Lo primero que hay que revisar
+> es la escritura de la URL o de la variable.
 
 ### 2.2 Metacomandos de `psql` (empiezan por `\`)
 
@@ -932,6 +952,37 @@ HINT:  ...                                                                    �
 antes de comprobar las restricciones (y el 2 en el intento del email repetido).
 Los ids del contador se reparten **antes** de validar, y no se devuelven. Por eso
 los huecos en los ids son normales y nunca hay que usarlos para contar filas.
+
+**Las secuencias (`usuarios_id_seq`, `pedidos_id_seq`)**
+
+El "contador interno" de `GENERATED ... AS IDENTITY` es un objeto real de
+Postgres llamado **secuencia**. Se crea solo, con el nombre `tabla_columna_seq`,
+y aparece en `\d` (sin argumentos), `\ds` y `\dp`.
+
+```sql
+\ds                                   -- listar secuencias
+SELECT last_value FROM pedidos_id_seq;-- último número repartido
+SELECT nextval('pedidos_id_seq');     -- ⚠️ pide el SIGUIENTE (y lo gasta: crea un hueco)
+```
+
+- Una secuencia solo sabe **dar el siguiente número**. No mira la tabla, no sabe si
+  el `INSERT` acabó bien. Por eso los ids que reparte para `INSERT` fallidos se pierden.
+- `nextval` es **no transaccional**: un `ROLLBACK` **no** devuelve el número.
+  Es a propósito: así dos inserciones a la vez nunca reciben el mismo id y no
+  tienen que esperarse la una a la otra.
+- La secuencia "pertenece" a la columna: si haces `DROP TABLE`, se borra con ella.
+
+> ⚠️ **Gotcha para el trabajo (`SERIAL`):** en tablas creadas con `id SERIAL`
+> (la forma antigua), el rol de la API necesita **además** permiso sobre la secuencia
+> para poder hacer `INSERT`; si no: `permission denied for sequence xxx_id_seq`.
+>
+> ```sql
+> GRANT USAGE ON SEQUENCE pedidos_id_seq TO api_curso;
+> -- o todas:  GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO api_curso;
+> ```
+>
+> Con `GENERATED ... AS IDENTITY` (la forma moderna, la nuestra) basta con el
+> permiso de `INSERT` sobre la tabla.
 
 ### 3.6 Modificar una tabla que ya existe: `ALTER TABLE`
 
@@ -1579,9 +1630,103 @@ Para configuración **obligatoria**, que reviente en la primera línea con un
 error que diga exactamente qué falta. `getenv` es para cosas **opcionales**
 con valor por defecto: `os.getenv("PUERTO", "8000")`.
 
+**Ejemplo real del curso** (ejecutando el script con el botón ▶ del editor, sin cargar el `.env`):
+
+```
+Traceback (most recent call last):
+  File ".../prueba_conexion.py", line 6, in <module>          ← 2º) la ÚLTIMA línea de TU código: aquí empezó
+    with psycopg.connect(url) as conn:
+  File ".../site-packages/psycopg/connection.py", line 97 ...  ← código de la librería (lo saltas)
+  ...
+  File ".../site-packages/psycopg/conninfo.py", line 101 ...
+    return pq.Conninfo.parse(conninfo.encode())
+AttributeError: 'NoneType' object has no attribute 'encode'    ← 1º) EL ERROR: se lee primero
+```
+
+**Cómo leer un *traceback* de Python:**
+1. Empieza por **abajo**: la última línea es el error (`tipo: mensaje`).
+2. Sube hasta la **última línea que sea de tu código** (no de `site-packages/`, que
+   son librerías). Ahí está lo que tú hiciste mal; el resto es "por dónde pasó".
+3. Traduce: `'NoneType' object has no attribute 'encode'` = "alguien recibió
+   `None` donde esperaba un texto". ¿Qué le pasé yo a `connect`? `url`. ¿De dónde sale? `getenv` → `None`.
+
+El error salta **4 llamadas más adentro**, en código que no es tuyo, y no
+menciona `DATABASE_URL` por ningún lado. Eso es justo lo que evita `os.environ[...]`.
+
+**¿Por qué `url` era `None`?** Las variables de entorno son **de cada proceso**:
+un programa recibe una **copia** de las de quien lo lanza. Hacer `source .env`
+en una terminal solo afecta a **esa** terminal y a lo que lances **desde ella**.
+El botón ▶ del editor lanza Python desde otro proceso, que nunca vio el `.env`.
+(En la lección 7 haremos que la propia app cargue el `.env` sola.)
+
 **El usuario de la API solo ve lo que se le ha dado:** `api_curso` tiene
 `SELECT` en `usuarios`, pero **no** en `pedidos` → `permission denied for table pedidos`.
 Lo del `\dp` de la lección 2 aplica igual desde Python.
+
+```
+psycopg.errors.InsufficientPrivilege: permission denied for table pedidos
+```
+
+**psycopg convierte cada error de Postgres en una excepción de Python con nombre propio:**
+
+| Error en `psql` | Excepción en Python |
+|---|---|
+| `permission denied for table ...` | `psycopg.errors.InsufficientPrivilege` |
+| `duplicate key value violates unique constraint` | `psycopg.errors.UniqueViolation` |
+| `violates foreign key constraint` | `psycopg.errors.ForeignKeyViolation` |
+| `violates not-null constraint` | `psycopg.errors.NotNullViolation` |
+| `violates check constraint` | `psycopg.errors.CheckViolation` |
+
+Así se pueden **capturar por tipo** con `try/except` y responder distinto a
+cada uno (p. ej. `UniqueViolation` → HTTP 409 "ese email ya existe"). Lección 9.
+
+Solución aplicada en el curso: `GRANT SELECT ON pedidos TO api_curso;` (como `postgres`).
+Solo `r`: la API de momento solo **lee** pedidos → mínimo privilegio.
+
+**Por qué `SELECT *` + desempaquetado se rompe:**
+
+```python
+cur.execute("SELECT * FROM pedidos")              # devuelve 5 columnas
+for index, id, producto, precio in filas:         # pero aquí esperas 4
+# ValueError: too many values to unpack (expected 4)
+```
+
+- *too many values to unpack (expected 4)* = la tupla trae **más** valores que variables.
+  (*not enough values* = trae **menos**.)
+- Con `SELECT *` el número de columnas lo decide **la tabla**, no tu código: si
+  alguien añade una columna, el código que funcionaba se rompe. Con las columnas
+  escritas en el `SELECT`, **tú** controlas cuántas y en qué orden.
+
+**Nombres de variables:**
+- Que digan **lo que son**: `pedido_id`, `usuario_id`, `importe` (como la columna),
+  no `index`, `id`, `precio`.
+- No uses `id` como variable: **tapa** la función `id()` de Python (igual con
+  `list`, `type`, `input`, `sum`...).
+
+### 5.6 Tipos de Postgres → tipos de Python
+
+Resultado de `fetchall()` sobre `pedidos`:
+
+```python
+[(1, 1, 'Iphone 18 pro max', Decimal('1883.95'),
+  datetime.datetime(2026, 11, 12, 9, 57, 44, 206571, tzinfo=zoneinfo.ZoneInfo(key='Etc/UTC'))), ...]
+```
+
+- `fetchall()` → **lista** de filas; cada fila es una **tupla**, con las columnas en el orden del `SELECT`.
+- psycopg **convierte los tipos** automáticamente:
+
+| Postgres | Python | Ojo |
+|---|---|---|
+| `int` | `int` | |
+| `text` | `str` | |
+| `boolean` | `bool` | |
+| `NULL` | `None` | |
+| `numeric(10,2)` | `Decimal('1883.95')` | **No** `float`: `Decimal` es exacto, como `numeric`. Con `float`, `0.1 + 0.2 = 0.30000000000000004` |
+| `timestamptz` | `datetime` **con zona** (`tzinfo=UTC`) | Un *datetime "aware"*: sabe en qué zona está. Compararlo con uno sin zona da error |
+
+> 💡 Al devolverlo en la API, FastAPI convierte esto a JSON: `Decimal` → número
+> (o texto, según configuración), `datetime` → texto ISO `"2026-11-12T09:57:44.206571Z"`.
+> El JSON no tiene tipo "fecha": las fechas viajan como texto.
 
 **`.env` / `.env.example` / `.gitignore`:**
 - `.env.example` con un **ejemplo del formato**, no vacío: quien clone el repo tiene que saber qué poner.
