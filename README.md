@@ -16,12 +16,13 @@
 | 3 | SQL básico: tablas, tipos, claves, CRUD | ✅ |
 | 4 | Relaciones: claves foráneas, JOINs, índices | ✅ |
 | 5 | Proyecto Python: entorno virtual, dependencias, variables de entorno | ✅ |
-| 6 | FastAPI: primer endpoint, rutas, Swagger (`/docs`) | ⬜ |
-| 7 | Conectar FastAPI con PostgreSQL (pool de conexiones) | ⬜ |
-| 8 | CRUD completo con Pydantic (validación de entrada/salida) | ⬜ |
+| 6 | FastAPI: primer endpoint, rutas, Swagger (`/docs`) | ✅ |
+| 7 | Conectar FastAPI con PostgreSQL (pool de conexiones) | ✅ |
+| 8 | CRUD completo con Pydantic (validación de entrada/salida) | ⏳ en curso |
 | 9 | Errores, códigos HTTP y paginación | ⬜ |
 | 10 | Seguridad básica: SQL injection, credenciales, usuario de solo-lectura | ⬜ |
 | 11 | Trabajar contra un Postgres que **ya existe** (el caso del trabajo) | ⬜ |
+| 12 | SQLAlchemy: query builder y ORM (y migraciones con Alembic) | ⬜ |
 
 ---
 
@@ -1732,6 +1733,1321 @@ Resultado de `fetchall()` sobre `pedidos`:
 - `.env.example` con un **ejemplo del formato**, no vacío: quien clone el repo tiene que saber qué poner.
 - Añadir `__pycache__/` al `.gitignore` **antes** de que aparezca (Python lo crea al importar módulos).
 - Comprobar que git ignora un fichero: `git check-ignore -v .env`.
+
+---
+
+## Lección 6 — FastAPI: primer endpoint, rutas, Swagger
+
+### 6.1 HTTP en 5 minutos
+
+Una API web es un programa que **recibe peticiones HTTP** y **devuelve respuestas HTTP**.
+
+**Petición** (lo que manda el cliente):
+
+```
+GET /usuarios/4?incluir_pedidos=true HTTP/1.1
+└┬┘ └─────┬───┘└────────┬──────────┘
+método   ruta     query string (parámetros opcionales tras el ?)
+```
+
+**Respuesta** (lo que devuelve tu API):
+
+```
+HTTP/1.1 200 OK                      ← código de estado
+Content-Type: application/json       ← cabecera: "te mando JSON"
+
+{"id": 4, "nombre": "Anuel"}         ← cuerpo (body)
+```
+
+**Métodos** (el "verbo": qué quieres hacer):
+
+| Método | Para | SQL que suele ejecutar |
+|---|---|---|
+| `GET` | Leer | `SELECT` |
+| `POST` | Crear | `INSERT` |
+| `PUT` / `PATCH` | Reemplazar / modificar parte | `UPDATE` |
+| `DELETE` | Borrar | `DELETE` |
+
+**Códigos de estado** (se agrupan por la primera cifra):
+
+| Código | Significa | Ejemplo |
+|---|---|---|
+| `200 OK` | Todo bien | `GET` que encuentra lo pedido |
+| `201 Created` | Creado | `POST` correcto |
+| `204 No Content` | Bien, sin nada que devolver | `DELETE` correcto |
+| `400 Bad Request` | Petición mal hecha | |
+| `404 Not Found` | No existe | `GET /usuarios/999` |
+| `409 Conflict` | Choca con lo que hay | Email repetido |
+| `422 Unprocessable Content` | Datos con formato inválido | `/usuarios/abc` cuando se espera un número |
+| `500 Internal Server Error` | **Tu código ha fallado** | Una excepción sin capturar |
+
+> 💡 **4xx = la culpa es del cliente** (pidió algo mal). **5xx = la culpa es
+> del servidor** (tu código). Un buen API casi nunca devuelve 500: los errores
+> previsibles (no existe, repetido...) se convierten en un 4xx con un mensaje claro.
+
+**JSON:** el formato de texto en que viajan los datos. Se parece mucho a un `dict` de Python:
+
+```json
+{"id": 4, "nombre": "Anuel", "activo": true, "email": null, "pedidos": [1, 2]}
+```
+
+(`true`/`false`/`null` en minúscula, comillas **dobles** siempre.)
+
+### 6.2 La app mínima
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI()                 # la aplicación; el servidor la busca por este nombre
+
+@app.get("/")                   # "cuando llegue un GET a la ruta /, ejecuta esta función"
+def raiz():
+    return {"mensaje": "hola"}  # devuelves un dict → FastAPI lo convierte a JSON (200 OK)
+```
+
+- `@app.get("/ruta")` es un **decorador**: "registra" la función como la que atiende
+  esa combinación de **método + ruta**. A esa función se le llama ***endpoint***
+  (o *path operation* en la documentación de FastAPI).
+- Hay uno por método: `@app.post`, `@app.put`, `@app.patch`, `@app.delete`.
+- El nombre de la función no importa para la URL (solo sale en la documentación).
+
+### 6.3 Arrancar el servidor
+
+```bash
+fastapi dev main.py
+```
+
+- Arranca **uvicorn** (el servidor) en `http://127.0.0.1:8000`.
+- `dev` = modo desarrollo: **se recarga solo** al guardar cambios en el código.
+  (En producción se usa `fastapi run`, sin recarga.)
+- La terminal se queda "ocupada" mostrando cada petición que llega. **Ctrl+C** para pararlo.
+- `main.py` no es un nombre mágico, pero es la convención.
+
+**Probarlo:**
+- En el navegador: `http://localhost:8000/` (el navegador siempre hace `GET`).
+- Desde otra terminal con `curl`:
+
+```bash
+curl http://localhost:8000/
+curl -i http://localhost:8000/       # -i: muestra también código de estado y cabeceras
+```
+
+> ⚠️ **URLs con `&` → siempre entre comillas.** Para bash, `&` significa
+> "lanza esto en segundo plano":
+>
+> ```bash
+> curl -i http://localhost:8000/sumar?a=5&b=3
+> # bash lo entiende como DOS comandos:
+> #   1) curl -i http://localhost:8000/sumar?a=5   & ← en segundo plano → [1] 11652 (nº de trabajo, PID)
+> #   2) b=3                                          ← crea una variable de bash llamada b
+> # resultado: {"resultado":5}  (b no llegó nunca a la API)
+> ```
+>
+> Con `"..."`, bash pasa la URL entera a `curl` como un solo texto. Lo mismo
+> pasa con `?`, `*` y `[]`, que también son especiales para bash.
+>
+> (Que el JSON salga pegado al prompt es normal: la respuesta no acaba en salto
+> de línea. Si molesta: `curl -i ...; echo`.)
+
+### 6.4 Parámetros
+
+**Parámetro de ruta (*path parameter*):** forma parte de la URL. Para identificar **un recurso concreto**.
+
+```python
+@app.get("/libros/{libro_id}")
+def leer_libro(libro_id: int):          # el nombre tiene que coincidir con el de {llaves}
+    return {"libro_id": libro_id}
+```
+
+**Parámetro de consulta (*query parameter*):** va tras el `?`. Para **filtrar,
+ordenar, paginar**... Cualquier parámetro de la función que **no** esté en la ruta es de consulta.
+
+```python
+@app.get("/libros")
+def listar_libros(autor: str, limite: int = 10):    # con valor por defecto → opcional
+    return {"autor": autor, "limite": limite}
+# GET /libros?autor=Borges&limite=5
+# GET /libros?autor=Borges              → limite = 10
+# GET /libros                           → 422: falta "autor" (obligatorio)
+```
+
+**Los *type hints* (`: int`, `: str`) no son decoración:** FastAPI los usa para
+1. **Convertir**: en la URL todo es texto; `"5"` → `5`.
+2. **Validar**: `GET /libros/abc` con `libro_id: int` → **422** automático, con un
+   JSON que explica qué campo está mal y por qué. Tu función **ni se ejecuta**.
+3. **Documentar** (ver 6.5).
+
+**Comprobado en el curso** con un `print()` dentro de la función: con
+`/sumar?a=cinco` **no se imprime nada**. El orden es:
+
+```
+petición → FastAPI valida los parámetros → ¿válidos? ── no ──▶ 422 (tu función NUNCA se llama)
+                                                └─ sí ──▶ llama a tu función con a y b ya convertidos a int
+```
+
+Consecuencia: **dentro** de la función puedes fiarte de los tipos. `a` es un
+`int`, garantizado; no hace falta comprobar `if isinstance(a, int)`. Cuando
+usemos esos valores en SQL, sabremos que `usuario_id` es un número y no texto
+cualquiera mandado por un atacante.
+
+> 💡 Ruta vs consulta: `/usuarios/4` → "el usuario 4" (si no existe → 404).
+> `/usuarios?activo=true` → "la lista filtrada" (si no hay ninguno → `[]` con 200, no 404).
+
+**Con tipos vs sin tipos** (probado de verdad, con `def sumar(a: int, b: int = 0)` frente a `def sumar(a, b=0)`):
+
+| Petición | Con `: int` | Sin tipos |
+|---|---|---|
+| `/sumar?a=5&b=3` | `200` `{"resultado": 8}` | `200` `{"resultado": "53"}` 😱 (`"5" + "3"`) |
+| `/sumar?a=5` | `200` `{"resultado": 5}` | **`500`** (`"5" + 0` → `TypeError`) |
+| `/sumar?a=cinco` | `422` (no es un entero) | **`500`** (`"cinco" + 0`) |
+| `/sumar` | `422` (falta `a`) | `422` (falta `a`) |
+
+- Los *type hints* **no son obligatorios** en FastAPI: sin ellos **funciona**,
+  pero todo lo que viene de la URL llega como `str`.
+- Lo que hace obligatorio un parámetro es **no tener valor por defecto**, no el tipo.
+  Por eso `/sumar` da 422 en los dos casos.
+- Sin tipos, los errores no desaparecen: pasan de ser un **422 claro** a un
+  **500** o, peor aún, a un **200 con un resultado incorrecto**.
+
+**El JSON de un 422** (lo que recibe el frontend):
+
+```json
+{"detail": [{"type": "missing", "loc": ["query", "a"], "msg": "Field required", "input": null}]}
+```
+
+- `loc` → **dónde** está el problema: en la *query*, en el parámetro `a`.
+- `type` / `msg` → **qué** pasa: falta (`missing`) o tipo incorrecto (`int_parsing`).
+- `input` → qué valor llegó.
+- `detail` es una **lista**: si hay varios campos mal, vienen todos a la vez.
+
+### 6.5 Documentación automática: `/docs`
+
+Con el servidor arrancado, abre **`http://localhost:8000/docs`**:
+
+- **Swagger UI**: una página generada sola, con todos tus endpoints, sus
+  parámetros y tipos, y un botón **"Try it out"** para probarlos sin `curl`.
+- `http://localhost:8000/redoc` → la misma información con otro diseño.
+- `http://localhost:8000/openapi.json` → la especificación **OpenAPI** en bruto
+  (lo que usan las dos páginas; también se puede pasar a frontend para generar clientes).
+
+> 💡 En el trabajo, `/docs` es lo primero que se comparte con el equipo de
+> frontend: "ahí tenéis todos los endpoints y podéis probarlos".
+
+---
+
+## Lección 7 — Conectar FastAPI con PostgreSQL
+
+### 7.0 El mapa: qué piezas hay y cómo encajan
+
+Antes de entrar en el detalle, la foto completa. Hay **dos momentos** distintos:
+
+**A) Al arrancar la app** (una sola vez):
+
+```
+fastapi dev main.py
+  └─▶ Python importa main.py
+        └─▶ main.py importa db.py
+              └─▶ db.py importa config.py
+                    └─▶ Settings() lee el .env  → settings.database_url
+              └─▶ se crea el pool (todavía cerrado)
+        └─▶ se crea app = FastAPI(lifespan=lifespan)
+  └─▶ el servidor ejecuta la parte de lifespan ANTES del yield → pool.open()
+        └─▶ el pool abre 1 conexión con Postgres (min_size=1)
+  └─▶ "Application startup complete" → ya acepta peticiones
+```
+
+**B) En cada petición** (`GET /usuarios/1`):
+
+```
+llega la petición
+  └─▶ FastAPI busca qué función atiende GET /usuarios/{usuario_id}
+  └─▶ valida usuario_id: ¿es un int? (si no → 422 y se acaba aquí)
+  └─▶ ve que la función necesita "conn: Conn" → ejecuta get_conn() hasta su yield
+        └─▶ get_conn pide prestada una conexión al pool
+  └─▶ llama a tu endpoint con usuario_id=1 y conn=<la conexión>
+        └─▶ tu código: cursor → SQL → fetchone → return dict (o raise 404)
+  └─▶ FastAPI convierte lo devuelto a JSON y prepara la respuesta
+  └─▶ termina get_conn (lo que hay después del yield)
+        └─▶ COMMIT (o ROLLBACK si hubo excepción) y devuelve la conexión al pool
+  └─▶ responde al cliente
+```
+
+Al apagar (Ctrl+C) se ejecuta la parte de `lifespan` **después** del `yield` → `pool.close()`.
+
+Para entender cada pieza hacen falta unos cuantos conceptos de Python. Vamos por partes.
+
+---
+
+### 7.1 Conceptos de Python que necesitas
+
+#### a) Importar tus propios ficheros (módulos)
+
+Cada fichero `.py` es un **módulo**. Desde un fichero puedes usar lo que hay en otro:
+
+```python
+from config import settings     # "del fichero config.py, tráeme la variable settings"
+```
+
+- Python busca `config.py` en la carpeta desde la que arrancas (y en las del `.venv`).
+- La **primera vez** que se importa un módulo, Python **ejecuta el fichero entero**
+  de arriba abajo y guarda el resultado. Las siguientes veces, reutiliza lo guardado.
+- Consecuencia: `settings = Settings()` se ejecuta **una sola vez**, y todos los ficheros
+  que hacen `from config import settings` comparten **el mismo** objeto. Igual con `pool`.
+
+¿Por qué separar en 3 ficheros? Cada uno tiene **una responsabilidad**:
+`config.py` = configuración, `db.py` = acceso a la base de datos, `main.py` = la API.
+Cuando el proyecto crezca, sabrás dónde buscar cada cosa.
+
+#### b) Clases y herencia (lo justo)
+
+```python
+class Settings(BaseSettings):
+    database_url: str
+```
+
+- `class Settings` define un **tipo nuevo** de objeto.
+- `(BaseSettings)` = **hereda** de `BaseSettings`: Settings recibe "gratis" todo el
+  comportamiento que programaron los de pydantic (leer variables de entorno, el `.env`,
+  validar tipos...). Tú solo declaras **qué campos** quieres.
+- `database_url: str` = "quiero un campo llamado `database_url` y tiene que ser texto".
+  Es la misma idea que los *type hints* de los parámetros de FastAPI (lección 6).
+- `Settings()` (con paréntesis) = **crear un objeto** de esa clase. Es en ese momento
+  cuando se leen y validan las variables.
+
+#### c) Decoradores (repaso)
+
+Un decorador es una función que **recibe otra función y la modifica o la registra**.
+La `@` es solo un atajo de escritura:
+
+```python
+@app.get("/")
+def raiz(): ...
+
+# es exactamente lo mismo que:
+def raiz(): ...
+raiz = app.get("/")(raiz)     # app.get("/") devuelve un decorador; se le pasa raiz
+```
+
+Con `@app.get` el decorador **registra** la función como endpoint. Con
+`@asynccontextmanager` (más abajo) el decorador **transforma** la función en otra cosa.
+
+#### d) Gestores de contexto: `with`
+
+Hay recursos que **hay que cerrar siempre**: ficheros, conexiones, cursores...
+Si se te olvida, o salta un error antes de cerrar, se quedan abiertos (en
+Postgres: conexiones ocupadas para siempre).
+
+```python
+# Sin with: si f.read() lanza un error, f.close() nunca se ejecuta
+f = open("datos.txt")
+contenido = f.read()
+f.close()
+
+# Con with: el fichero se cierra SIEMPRE al salir del bloque, haya error o no
+with open("datos.txt") as f:
+    contenido = f.read()
+# aquí f ya está cerrado
+```
+
+Un objeto que se puede usar con `with` se llama **gestor de contexto** (*context manager*).
+Por dentro tiene dos métodos especiales:
+
+```
+with algo as x:          → se llama a algo.__enter__()   y lo que devuelve se guarda en x
+    ...bloque...
+                         → al salir se llama a algo.__exit__(...)
+                           (también si el bloque lanzó una excepción: __exit__ se entera de cuál)
+```
+
+Ya los has usado en la lección 5:
+
+```python
+with psycopg.connect(url) as conn:     # __enter__: conecta      __exit__: COMMIT/ROLLBACK y cierra
+    with conn.cursor() as cur:         # __enter__: crea cursor  __exit__: cierra el cursor
+        ...
+```
+
+> 💡 Regla de oro: **todo lo que se abre, se abre con `with`**.
+
+#### e) Generadores y `yield`
+
+Una función normal hace `return` y **termina**. Una función con `yield` es un
+**generador**: entrega un valor y se queda **pausada** en ese punto, esperando a
+que alguien le diga "sigue".
+
+```python
+def tres_pasos():
+    print("antes")
+    yield "valor"          # ← se pausa aquí y entrega "valor"
+    print("después")       # ← esto solo se ejecuta cuando alguien la reanude
+
+gen = tres_pasos()         # NO ejecuta nada todavía: solo crea el generador
+v = next(gen)              # ejecuta hasta el yield → imprime "antes"; v = "valor"
+next(gen)                  # reanuda tras el yield → imprime "después" (y termina → StopIteration)
+```
+
+La clave: **una sola función con un "antes" y un "después"**, y en medio, una pausa
+en la que **otro código** puede hacer cosas.
+
+#### f) `@contextmanager`: un gestor de contexto hecho con `yield`
+
+Escribir una clase con `__enter__` y `__exit__` es pesado. La librería estándar
+(`contextlib`) tiene un decorador que convierte un **generador** en un **gestor de contexto**:
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def cronometro():
+    inicio = time.time()           # ← "__enter__": se ejecuta al entrar en el with
+    yield                          # ← aquí se ejecuta el bloque del with
+    print(time.time() - inicio)    # ← "__exit__": se ejecuta al salir del with
+
+with cronometro():
+    hacer_algo_lento()             # ← esto es lo que "ocurre durante el yield"
+```
+
+```
+lo de ANTES del yield   = preparar        (abrir, conectar, empezar)
+el yield                = "ahora haz tu trabajo"
+lo de DESPUÉS del yield = limpiar          (cerrar, desconectar, terminar)
+```
+
+(Si el bloque lanza una excepción, esta "reaparece" en la línea del `yield`.
+Para que la limpieza se haga **sí o sí**, se envuelve en `try: yield finally: limpiar()`
+o se usa un `with` dentro, como haremos en `get_conn`.)
+
+#### g) `async`, `await` y `@asynccontextmanager`
+
+**El problema:** un servidor web pasa la mayor parte del tiempo **esperando** (a
+la red, a la base de datos...). Si mientras espera a uno no puede atender a otro,
+va muy lento.
+
+**`async def`** declara una **corrutina**: una función que puede **pausarse
+mientras espera** (con `await`) y dejar que, mientras tanto, se ejecute otra cosa.
+Quien reparte el turno entre todas es el **bucle de eventos** (*event loop*), que
+en nuestro caso lo pone uvicorn.
+
+```python
+async def tarea():
+    datos = await pedir_algo_por_red()   # "mientras llega, atiende a otros"
+    return datos
+```
+
+- Una función `async def` **no se puede llamar normal**: hay que hacer `await tarea()`
+  desde otra función async, o dejar que la ejecute el event loop.
+- `await` solo se puede usar **dentro** de un `async def`.
+
+**`@asynccontextmanager`** es lo mismo que `@contextmanager` (apartado f), pero
+para generadores `async def`. Crea un gestor de contexto **asíncrono**, que se usa
+con `async with` en vez de `with`.
+
+**¿Y por qué lo necesitamos?** Porque FastAPI, al arrancar, hace por dentro algo así:
+
+```python
+async with lifespan(app):     # ← ejecuta lo de antes del yield (arrancar)
+    atender_peticiones()      # ← toda la vida del servidor ocurre "durante el yield"
+# ← al apagar: ejecuta lo de después del yield
+```
+
+FastAPI **exige** que `lifespan` sea un gestor de contexto asíncrono porque todo
+su arranque y apagado funciona con el event loop. Por eso la función es
+`async def` y lleva `@asynccontextmanager`, aunque dentro no hagamos ningún `await`.
+
+---
+
+### 7.2 `config.py`: la configuración, línea a línea
+
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
+    database_url: str
+    debug: bool = False
+
+settings = Settings()
+```
+
+| Línea | Qué hace |
+|---|---|
+| `from pydantic_settings import ...` | Trae la clase base (`BaseSettings`) y la de configuración (`SettingsConfigDict`). |
+| `class Settings(BaseSettings):` | Define tu clase de configuración heredando todo el comportamiento de pydantic-settings (7.1 b). |
+| `model_config = SettingsConfigDict(env_file=".env")` | **Configura cómo se comporta la clase**: "además de las variables de entorno, lee el fichero `.env`". `model_config` es un nombre especial que pydantic busca; no es un campo. |
+| `database_url: str` | Campo **obligatorio** (no tiene `= valor`). Busca una variable `DATABASE_URL` (no distingue mayúsculas). Si no la encuentra → error al arrancar. |
+| `debug: bool = False` | Campo **opcional** con valor por defecto. Si en el `.env` pone `DEBUG=true`, lo convierte a `True` (valida el tipo, igual que FastAPI con los parámetros). |
+| `settings = Settings()` | **Aquí ocurre todo**: lee el entorno y el `.env`, convierte, valida y crea el objeto. Se usa como `settings.database_url`. |
+
+**De dónde saca cada valor** (de más a menos prioridad):
+1. Variables de entorno reales (`export DATABASE_URL=...`).
+2. El fichero `.env`.
+3. El valor por defecto del campo.
+
+Así, en producción (donde no hay `.env`) se definen variables de entorno y el
+código no cambia.
+
+> ⚠️ `env_file=".env"` es relativo a la **carpeta desde la que arrancas** el
+> servidor, no a la del fichero `config.py`. Arranca siempre desde la raíz del proyecto.
+
+---
+
+### 7.3 `db.py`: el pool de conexiones
+
+**Por qué un pool.** Abrir una conexión a Postgres **es caro**: conexión TCP +
+autenticación (scram-sha-256) + Postgres **crea un proceso nuevo** para
+atenderte. Varios milisegundos cada vez. Además, Postgres tiene un **límite** de
+conexiones simultáneas (`max_connections`, por defecto **100**). Con muchas
+peticiones abriendo y cerrando conexiones: lento, y al pasar del límite →
+`FATAL: sorry, too many clients already`.
+
+Un **pool** (piscina) abre unas cuantas conexiones y las **presta**:
+
+```
+petición 1 ──▶ pide prestada la conexión A ──▶ SQL ──▶ la devuelve al pool
+petición 2 ──▶ pide prestada la conexión B ──▶ SQL ──▶ la devuelve
+petición 3 ──▶ todas ocupadas → ESPERA a que se libere una (no abre más de max_size)
+```
+
+```python
+from psycopg_pool import ConnectionPool
+from config import settings
+
+pool = ConnectionPool(settings.database_url, min_size=1, max_size=5, open=False)
+```
+
+| Argumento | Qué hace |
+|---|---|
+| `settings.database_url` | A qué base de datos conectarse (la URL de siempre). |
+| `min_size=1` | Cuántas conexiones mantener **siempre abiertas**, aunque no haya peticiones. |
+| `max_size=5` | Cuántas conexiones como **máximo**. Si llegan 6 peticiones a la vez, la 6ª espera (por defecto hasta 30 s; si no se libera ninguna → error `PoolTimeout`). |
+| `open=False` | **Crea** el pool pero **no conecta todavía**. Si conectara aquí, lo haría en el momento de **importar** `db.py`: si Postgres no está, la app petaría al importar, y además conectaría en sitios donde no queremos (por ejemplo, en los tests). Lo abriremos explícitamente al arrancar la app (7.4). |
+
+> 💡 En el trabajo: `max_size` × número de copias de la API tiene que caber en
+> el `max_connections` del servidor, **compartido con el resto de equipos**.
+> Pregunta cuántas conexiones os corresponden.
+
+---
+
+### 7.4 `lifespan`: abrir y cerrar el pool con la app
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from db import pool
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    pool.open()
+    yield
+    pool.close()
+
+app = FastAPI(lifespan=lifespan)
+```
+
+| Línea | Qué hace |
+|---|---|
+| `from contextlib import asynccontextmanager` | Trae el decorador de 7.1 g. `contextlib` es de la biblioteca estándar de Python. |
+| `@asynccontextmanager` | Convierte la función generadora en un gestor de contexto asíncrono, que es lo que FastAPI exige. |
+| `async def lifespan(app: FastAPI):` | `async` porque FastAPI lo ejecuta con `async with`. Recibe la `app` (no la usamos, pero FastAPI se la pasa). El nombre `lifespan` ("tiempo de vida") es convención. |
+| `pool.open()` | **Antes del `yield`** = al arrancar. Abre el pool: conecta las `min_size` conexiones. Si Postgres no responde, la app **no llega a arrancar** (mejor fallar aquí que en la primera petición). |
+| `yield` | "Ya está todo listo: atiende peticiones". La app vive **todo el tiempo** que está pausada aquí. |
+| `pool.close()` | **Después del `yield`** = al apagar (Ctrl+C). Cierra todas las conexiones limpiamente. |
+| `app = FastAPI(lifespan=lifespan)` | Le dices a FastAPI qué gestor de contexto usar para el arranque y el apagado. Sin esto, la función existe pero nadie la llama. |
+
+En los logs de `fastapi dev` se ve cada fase:
+
+```
+INFO:     Waiting for application startup.      ← ejecutando lo de antes del yield
+INFO:     Application startup complete.         ← ya está en el yield, atendiendo
+INFO:     Waiting for application shutdown.     ← Ctrl+C: ejecutando lo de después
+INFO:     Application shutdown complete.
+```
+
+---
+
+### 7.5 Dependencias: una conexión por petición con `Depends`
+
+**El concepto (inyección de dependencias).** Muchos endpoints necesitan lo mismo
+antes de empezar: una conexión, el usuario que ha iniciado sesión, la
+configuración... En vez de que cada endpoint lo consiga por su cuenta, **declara
+que lo necesita** y FastAPI **se lo da** ("se lo inyecta").
+
+```python
+# db.py
+from typing import Annotated
+from fastapi import Depends
+from psycopg import Connection
+
+def get_conn():
+    with pool.connection() as conn:
+        yield conn
+
+Conn = Annotated[Connection, Depends(get_conn)]
+```
+
+| Línea | Qué hace |
+|---|---|
+| `def get_conn():` | Una función normal (sin decorador). Es la **dependencia**. |
+| `with pool.connection() as conn:` | Pide **prestada** una conexión al pool. Si están todas ocupadas, espera. `pool.connection()` es un gestor de contexto: al salir del `with` hace **`COMMIT`** si no hubo error (o **`ROLLBACK`** si lo hubo) y **devuelve** la conexión al pool (no la cierra). |
+| `yield conn` | Entrega la conexión a FastAPI y se **pausa**. FastAPI se la pasa a tu endpoint. Cuando el endpoint termina, FastAPI reanuda `get_conn` → se sale del `with` → commit/rollback + devolver. |
+| `Conn = Annotated[Connection, Depends(get_conn)]` | Un **alias** de tipo para no repetirlo en cada endpoint (ver abajo). |
+
+Es el mismo patrón "antes / yield / después" de 7.1 f, pero esta vez quien lo
+gestiona es FastAPI: `get_conn` **no** lleva `@contextmanager`; FastAPI reconoce
+el `yield` y sabe qué hacer.
+
+**`Annotated` y `Depends`:**
+
+```python
+Annotated[Connection, Depends(get_conn)]
+#         └─ tipo ─┘  └─── metadato ───┘
+```
+
+- `Annotated[Tipo, extra]` es una forma estándar de Python de decir "esto es de tipo
+  `Connection`, y además le pego esta información extra". Python ignora el extra;
+  **FastAPI lo lee**.
+- `Depends(get_conn)` es el extra: "para rellenar este parámetro, ejecuta `get_conn`".
+- El tipo `Connection` sirve para que el editor te autocomplete (`conn.cursor()`...).
+
+**Cómo se usa en un endpoint:**
+
+```python
+@app.get("/libros")
+def listar_libros(conn: Conn):     # ← FastAPI ve "Conn" → ejecuta get_conn() y te pasa la conexión
+    ...
+```
+
+Para FastAPI hay tres tipos de parámetros: los que están en la ruta `{...}`
+(ruta), los que tienen `Depends` (dependencias) y el resto (consulta, `?a=...`).
+
+**Ventaja extra:** los endpoints no saben **de dónde** sale la conexión. En los
+tests se puede sustituir `get_conn` por otra que use una base de datos de
+pruebas, sin tocar ni un endpoint.
+
+---
+
+### 7.6 Ejecutar SQL y recibir diccionarios: cursor + `dict_row`
+
+```python
+from psycopg.rows import dict_row
+
+@app.get("/libros")
+def listar_libros(conn: Conn):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id, titulo FROM libros ORDER BY id")
+        return cur.fetchall()
+```
+
+| Línea | Qué hace |
+|---|---|
+| `conn.cursor(...)` | Crea un **cursor**: el objeto por el que mandas SQL y recoges filas. Con `with`, se cierra al acabar. |
+| `row_factory=dict_row` | "Fábrica de filas": decide **cómo se construye cada fila**. Por defecto, tuplas `(1, 'Ana')`. Con `dict_row`, diccionarios `{"id": 1, "titulo": "Ana"}`. |
+| `cur.execute("SELECT ...")` | Manda el SQL a Postgres. |
+| `cur.fetchall()` | Recoge **todas** las filas → lista de diccionarios. Si no hay ninguna → `[]`. |
+| `return ...` | FastAPI convierte la lista de diccionarios a JSON y responde **200**. |
+
+**Por qué diccionarios:** JSON es "clave: valor". Con tuplas FastAPI devolvería
+`[[1, "Ana"]]` (listas sin nombres); con diccionarios, `[{"id": 1, "titulo": "Ana"}]`.
+Las claves son los **nombres de las columnas del `SELECT`** (o sus `AS`), por eso
+en un JOIN conviene poner alias (lección 4).
+
+(También se puede configurar para todo el pool:
+`ConnectionPool(..., kwargs={"row_factory": dict_row})`, y así no ponerlo en cada cursor.)
+
+---
+
+### 7.7 Parámetros en el SQL: `%s`, **nunca** f-strings 🚨
+
+```python
+# ❌ NUNCA: meter datos que vienen de fuera en el SQL con f-string, + o .format()
+cur.execute(f"SELECT * FROM libros WHERE titulo = '{titulo}'")
+
+# ✅ SIEMPRE: marcador %s y los valores aparte, en una tupla
+cur.execute("SELECT id, titulo FROM libros WHERE titulo = %s", (titulo,))
+```
+
+**Por qué (SQL injection):** si alguien manda como `titulo` el texto `x' OR '1'='1`,
+la f-string construye:
+
+```sql
+SELECT * FROM libros WHERE titulo = 'x' OR '1'='1'    -- '1'='1' siempre es cierto → TODOS los libros
+```
+
+El texto del usuario ha **dejado de ser un dato y se ha convertido en SQL**. Con
+`'; DROP TABLE libros; --` sería peor.
+
+Con `%s`, psycopg manda a Postgres **el SQL por un lado y los valores por otro**.
+Postgres sabe que lo que llega en el hueco es **un valor**, nunca código, por raro
+que sea su contenido. (Lo veremos a fondo, atacando nuestra propia API, en la lección 10.)
+
+Detalles de `%s`:
+- Se usa `%s` para **cualquier** tipo (número, texto, fecha...), no solo strings. **Sin comillas** alrededor.
+- Los valores van en una **tupla**, en el mismo orden que los `%s`.
+- Con un solo valor: `(libro_id,)` **con coma**. `(libro_id)` sin coma son solo
+  paréntesis alrededor de un número, no una tupla → error.
+- Solo sirve para **valores**, no para nombres de tablas o columnas.
+
+---
+
+### 7.8 Uno o ninguno: `fetchone()` y el 404
+
+```python
+from fastapi import HTTPException
+
+@app.get("/libros/{libro_id}")
+def leer_libro(libro_id: int, conn: Conn):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id, titulo FROM libros WHERE id = %s", (libro_id,))
+        libro = cur.fetchone()
+
+    if libro is None:
+        raise HTTPException(status_code=404, detail="Libro no encontrado")
+    return libro
+```
+
+| Línea | Qué hace |
+|---|---|
+| `libro_id: int` | Parámetro **de ruta** (está en `{libro_id}`), validado como entero. |
+| `conn: Conn` | La conexión prestada (7.5). |
+| `... WHERE id = %s", (libro_id,)` | Busca por id, pasando el valor de forma segura (7.7). |
+| `cur.fetchone()` | Recoge **una** fila: un diccionario, o **`None`** si la consulta no devolvió nada. |
+| `if libro is None:` | `is None` es la forma correcta de comprobar `None` en Python (como `IS NULL` en SQL). |
+| `raise HTTPException(status_code=404, detail=...)` | **Lanza** una excepción especial que FastAPI captura y convierte en una respuesta `404` con el JSON `{"detail": "Libro no encontrado"}`. |
+| `return libro` | Si existe → 200 con el libro en JSON. |
+
+**`raise` vs `return`:** `raise` **corta** la ejecución en ese punto (lo de debajo
+no se ejecuta) y sube por todas las funciones que la llamaron hasta que alguien
+la captura (aquí, FastAPI). Si hicieras `return HTTPException(...)`, FastAPI
+intentaría devolver el objeto excepción como si fuera un dato normal, con un 200.
+
+---
+
+### 7.9 `def` vs `async def` en los endpoints
+
+psycopg, usado como lo usamos, es **síncrono**: cuando haces `cur.execute(...)`,
+el hilo se queda **bloqueado** esperando a Postgres. ¿Cómo atiende entonces
+FastAPI varias peticiones a la vez?
+
+| Endpoint declarado con | Cómo lo ejecuta FastAPI | Con psycopg síncrono dentro |
+|---|---|---|
+| `def` | En un **hilo aparte** (de un grupo de hilos). Si se bloquea, solo se bloquea ese hilo; el resto de peticiones siguen en otros. | ✅ Correcto |
+| `async def` | **Directamente en el event loop** (7.1 g), que es **uno solo** para toda la app. | ❌ Mientras espera a Postgres, **toda la API se para** |
+
+**Regla:** si dentro usas código que bloquea (psycopg normal, `requests`,
+`time.sleep`...), endpoint con `def`. `async def` solo si todo lo de dentro es
+asíncrono (con `await`). Para empezar, **`def` siempre**.
+
+(Existe una versión asíncrona de psycopg, `AsyncConnectionPool`, para usar con
+`async def` y `await cur.execute(...)`. Más rendimiento, más complejidad. No la necesitamos todavía.)
+
+---
+
+### 7.10 En proyectos reales: ¿SQL a mano, *query builder* u ORM?
+
+Hay **tres formas** de hablar con la base de datos desde Python, de menos a más
+abstracción. La misma consulta ("usuarios activos, ordenados por nombre") en cada una:
+
+**1. SQL a mano con el driver** (lo que hacemos en el curso: psycopg, asyncpg...)
+
+```python
+cur.execute("SELECT id, nombre FROM usuarios WHERE activo = %s ORDER BY nombre", (True,))
+```
+
+**2. *Query builder*: construyes el SQL con funciones de Python** (SQLAlchemy Core, PyPika...)
+
+```python
+stmt = select(usuarios.c.id, usuarios.c.nombre).where(usuarios.c.activo == True).order_by(usuarios.c.nombre)
+conn.execute(stmt)
+```
+
+**3. ORM (*Object-Relational Mapper*): cada tabla es una clase y cada fila un objeto**
+(SQLAlchemy ORM, SQLModel, Django ORM...)
+
+```python
+class Usuario(Base):                                  # la tabla, definida como clase
+    __tablename__ = "usuarios"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    nombre: Mapped[str]
+    activo: Mapped[bool]
+
+usuarios = session.scalars(select(Usuario).where(Usuario.activo).order_by(Usuario.nombre)).all()
+usuarios[0].nombre                                    # objetos, no diccionarios
+```
+
+| | SQL a mano | Query builder | ORM |
+|---|---|---|---|
+| Qué escribes | SQL tal cual | Python que genera SQL | Clases y objetos |
+| Control sobre el SQL | Total | Alto | Medio (genera él el SQL) |
+| Consultas complejas (informes, JOINs raros) | ✅ Lo más fácil | ✅ | ⚠️ A veces se pelea con él |
+| Consultas que se construyen según filtros opcionales | ⚠️ Concatenar trozos de SQL es delicado | ✅ Su punto fuerte | ✅ |
+| Errores de escritura | Los ves al ejecutar | El editor los detecta antes | El editor los detecta antes |
+| Curva de aprendizaje | SQL | SQL + la librería | SQL + bastante librería |
+| Peligro típico | Olvidar `%s` → SQL injection | — | Problema **N+1**: sin darte cuenta lanza 1 consulta por fila |
+
+**Qué se usa en la práctica (FastAPI + Postgres):**
+- **SQLAlchemy** (versión 2.x) es el estándar de facto en Python: tiene las dos
+  capas, *Core* (query builder) y *ORM*, y se pueden mezclar. Va casi siempre
+  acompañado de **Alembic** para las migraciones (cambios de esquema versionados).
+- **SQLModel** es una capa sobre SQLAlchemy hecha por el autor de FastAPI; une
+  los modelos de la base de datos y los de Pydantic.
+- **SQL a mano** sigue siendo muy común en equipos pequeños, en APIs de
+  **solo lectura / informes** y en partes donde importa mucho el rendimiento.
+  Muchos proyectos con ORM tienen también consultas en SQL a mano para lo complejo.
+
+> 💡 **Por qué empezamos con SQL a mano:** un ORM **genera SQL por ti**. Si no
+> sabes SQL, cuando algo vaya lento o falle no entenderás qué está haciendo. Todo
+> lo que has aprendido (JOINs, índices, transacciones, permisos) se aplica igual
+> con un ORM; solo cambia **cómo** lo escribes.
+>
+> **Para el trabajo:** pregunta qué usa el proyecto. Si os dan un Postgres que
+> **ya existe** y lo gestiona otro equipo, es habitual no usar migraciones y,
+> o bien escribir SQL a mano, o bien definir en SQLAlchemy solo las tablas que
+> vais a usar (o que las lea él solo de la base de datos: *reflection*).
+
+### 7.11 Lecciones de la revisión de código
+
+**`(valor)` no es una tupla, `(valor,)` sí.** Error real del curso:
+
+```python
+cur.execute("... WHERE id = %s", (usuario_id))    # → TypeError: object of type 'int' has no len()
+```
+
+psycopg intenta contar los parámetros con `len()` y recibe un `int` suelto.
+
+**En SQL se compara con `=`, no con `==`.** `WHERE id == %s` → error de Postgres
+(`operator does not exist`). Python y SQL se mezclan en el mismo fichero: ojo
+con cuál de los dos estás escribiendo.
+
+**`fetchall()` nunca devuelve `None`.** Si no hay filas devuelve una lista vacía `[]`.
+`if filas is None:` no se cumple jamás (código muerto). Para "¿hay filas?": `if not filas:`.
+
+**Lista vacía ≠ no existe:**
+
+| Petición | Situación | Respuesta correcta |
+|---|---|---|
+| `GET /usuarios/4/pedidos` | El usuario existe, no tiene pedidos | **`200`** con `[]` |
+| `GET /usuarios/999/pedidos` | El usuario **no existe** | **`404`** |
+
+Una lista vacía es una respuesta válida: "no hay ninguno". El 404 es para cuando
+**el recurso de la ruta** (`/usuarios/999`) no existe. Por eso hay que comprobar
+primero que el usuario existe.
+
+**Comprobar que algo existe → no hace falta traerlo entero:**
+
+```sql
+SELECT 1 FROM usuarios WHERE id = %s          -- devuelve una fila con un 1, o ninguna
+```
+
+**No hagas JOIN si no lo necesitas.** Para "los pedidos del usuario 5", la tabla
+`pedidos` ya tiene `usuario_id`: basta con `SELECT ... FROM pedidos WHERE usuario_id = %s`.
+El JOIN solo hace falta si quieres **columnas de la otra tabla** (por ejemplo, el
+nombre del usuario). Y todo `JOIN` necesita su `ON` (lección 4.5).
+
+**SQL largo en varias líneas: comillas triples.**
+
+```python
+# ⚠️ funciona, pero frágil: dos textos seguidos se pegan solos, y si olvidas
+#    el espacio del final queda "...pedidos pWHERE" → syntax error
+cur.execute("SELECT id FROM pedidos p "
+            "WHERE p.usuario_id = %s", (usuario_id,))
+
+# ✅ más claro: un solo texto que ocupa varias líneas
+cur.execute("""
+    SELECT id, producto, importe
+    FROM pedidos
+    WHERE usuario_id = %s
+    ORDER BY id
+""", (usuario_id,))
+```
+
+(La `\` al final de línea no hace falta dentro de paréntesis: Python ya sabe que la expresión continúa.)
+
+**Cómo viajan `Decimal` y `datetime` en el JSON** (respuesta real de `/usuarios/1/pedidos`):
+
+```json
+{"id": 1, "producto": "Iphone 18 pro max", "importe": 1883.95, "creado_en": "2026-11-12T09:57:44.206571+00:00"}
+```
+
+- `Decimal('1883.95')` → número `1883.95`. FastAPI lo convierte a `float` para el
+  JSON; para mostrar precios va bien, pero si el frontend **hace cuentas** con
+  dinero, a veces se prefiere mandarlo como texto `"1883.95"` (lo controlaremos
+  con los modelos de la lección 8).
+- `datetime` → **texto** en formato **ISO 8601**: `fecha T hora +zona`. JSON no
+  tiene tipo fecha; el frontend lo vuelve a convertir (en JavaScript: `new Date("2026-11-12T09:57:44+00:00")`).
+  El `+00:00` es la zona (UTC): por eso usamos `timestamptz`.
+
+### 7.12 Resumen: qué fichero hace qué
+
+| Fichero | Responsabilidad | Se ejecuta... |
+|---|---|---|
+| `config.py` | Leer y validar la configuración (`.env`) | Una vez, al importarlo |
+| `db.py` | Crear el pool y prestar conexiones (`get_conn`, `Conn`) | El pool: una vez. `get_conn`: en cada petición |
+| `main.py` | La app, su `lifespan` y los endpoints | `lifespan`: al arrancar y al apagar. Endpoints: en cada petición |
+
+
+---
+
+## Lección 8 — CRUD completo con Pydantic
+
+### 8.0 El mapa
+
+Hasta ahora la API solo **leía**. Para **crear y modificar**, el cliente tiene
+que **mandarnos datos**, y aparecen dos problemas nuevos:
+
+1. **Lo que entra**: ¿y si el cliente manda un email que no es un email, un
+   nombre vacío, un importe negativo, o campos que no existen?
+2. **Lo que sale**: ¿cómo garantizamos que la respuesta tiene siempre la misma
+   forma y que **nunca** se escapa un campo que no debe salir (una contraseña, un dato interno)?
+
+La herramienta para las dos cosas es **Pydantic**: describes la **forma** de los
+datos con una clase, y Pydantic valida, convierte y filtra.
+
+```
+POST /usuarios   body: {"nombre": "Eva", "email": "eva@mail.com"}
+  └─▶ FastAPI lee el body (JSON) y lo valida contra el modelo de ENTRADA (UsuarioCrear)
+        ¿no cuadra? → 422 con el detalle (tu función ni se ejecuta)
+  └─▶ llama a tu endpoint con un objeto UsuarioCrear ya validado
+        └─▶ INSERT ... RETURNING ...  → dict con la fila creada
+  └─▶ FastAPI pasa ese dict por el modelo de SALIDA (UsuarioLeer):
+        se queda solo con sus campos, comprueba tipos, convierte a JSON
+  └─▶ get_conn: COMMIT y devuelve la conexión
+  └─▶ responde 201 Created + el usuario creado
+```
+
+---
+
+### 8.1 Mandar datos: el *body* de la petición
+
+En un `GET` los datos van en la URL (ruta y `?consulta`). Para **crear o
+modificar**, los datos van en el **cuerpo** (*body*) de la petición, en JSON:
+
+```
+POST /libros HTTP/1.1
+Content-Type: application/json          ← cabecera: "lo que te mando es JSON"
+
+{"titulo": "Ficciones", "paginas": 200}  ← el body
+```
+
+**Por qué no en la URL:** las URLs tienen límite de tamaño, se guardan en logs e
+historiales del navegador (mala idea para datos personales) y solo admiten texto
+plano. El body admite JSON con estructura (listas, objetos dentro de objetos...).
+
+**Con `curl`:**
+
+```bash
+curl -i -X POST "http://localhost:8000/libros" \
+     -H "Content-Type: application/json" \
+     -d '{"titulo": "Ficciones", "paginas": 200}'
+```
+
+| Opción | Qué hace |
+|---|---|
+| `-X POST` | Usa el método POST (por defecto `curl` hace GET) |
+| `-H "Content-Type: application/json"` | Añade la cabecera que dice "el body es JSON" |
+| `-d '...'` | El body. Entre comillas **simples** por fuera, para poder usar comillas **dobles** dentro (el JSON las exige) |
+
+(En `/docs` es más cómodo: "Try it out" te deja editar el body en un cuadro.)
+
+#### ¿Por qué `application/json`? Los tipos MIME
+
+El body es **solo una ristra de bytes**. `{"titulo": "Ficciones"}` podría ser
+JSON, texto plano o un trozo de formulario. El servidor no lo adivina, así que
+el cliente lo **declara** en la cabecera `Content-Type` con un **tipo MIME**
+(*media type*). Tiene el formato `tipo/subtipo`:
+
+| Tipo MIME | Qué es | Dónde lo verás |
+|---|---|---|
+| `application/json` | JSON | APIs como la nuestra |
+| `application/x-www-form-urlencoded` | `titulo=Ficciones&paginas=200` | formularios HTML clásicos |
+| `multipart/form-data` | campos + ficheros | subir ficheros |
+| `text/plain` | texto sin formato | — |
+| `text/html` | una página web | navegador |
+| `image/png` | una imagen | — |
+
+**¿Por qué "application" y no "text"?** La primera parte es la familia:
+`text/` es texto para leerlo una persona, `image/` imágenes, y `application/`
+son datos **para que los procese un programa**. JSON es eso: datos
+estructurados que va a parsear una aplicación, así que el nombre oficial
+(RFC 8259) es `application/json`.
+
+**La trampa de `curl`:** si usas `-d` **sin** `-H`, `curl` manda por defecto
+`Content-Type: application/x-www-form-urlencoded`. FastAPI no lo lee como JSON
+y devuelve un 422 (comprobado):
+
+```json
+{"detail": [{"type": "model_attributes_type", "loc": ["body"],
+  "msg": "Input should be a valid dictionary or object to extract fields from",
+  "input": "{\"titulo\": \"Ficciones\"}"}]}
+```
+
+Fíjate en el `input`: le ha llegado el texto **como un string**, no como un
+objeto. Si ves este error, lo primero es comprobar la cabecera.
+
+**Y al revés:** en la respuesta, el servidor también manda `Content-Type`. Con
+`curl -i` verás `content-type: application/json`, y así el cliente sabe cómo
+leer lo que le devuelven. Lo ves en cada respuesta, y FastAPI la pone solo.
+
+---
+
+### 8.2 Pydantic: describir la forma de los datos
+
+#### a) `BaseModel`: un modelo es una clase con campos tipados
+
+Ya lo viste con `Settings` (lección 7): heredar de una clase de Pydantic y
+declarar campos con tipo. `BaseModel` es la clase base general:
+
+```python
+from pydantic import BaseModel
+
+class LibroCrear(BaseModel):
+    titulo: str
+    paginas: int
+
+libro = LibroCrear(titulo="Ficciones", paginas="200")   # "200" → 200 (convierte)
+libro.titulo        # "Ficciones"   ← se accede con punto, como atributos
+libro.paginas       # 200 (int)
+
+LibroCrear(titulo="Ficciones", paginas="muchas")
+# ValidationError: paginas → Input should be a valid integer
+```
+
+Al crear el objeto, Pydantic **valida y convierte** cada campo. Si algo no
+cuadra, lanza `ValidationError` con el detalle de **todos** los campos mal.
+FastAPI captura ese error y lo convierte en el **422** que ya conoces.
+
+#### b) Campos opcionales y valores por defecto
+
+```python
+class LibroCrear(BaseModel):
+    titulo: str                        # obligatorio
+    subtitulo: str | None = None       # opcional: puede no venir, o venir null
+    disponible: bool = True            # opcional: si no viene, True
+```
+
+- `str | None` se lee "texto **o** None". El `|` entre tipos significa "o".
+- `= None` / `= True` → el valor por defecto. **Tener valor por defecto es lo que
+  hace opcional a un campo** (igual que con los parámetros de las funciones).
+- `str | None` sin `= None` → obligatorio, pero puede valer `null`. Raro; casi siempre van juntos.
+
+#### c) Restricciones con `Field`
+
+El tipo dice "es un texto"; `Field` añade **reglas** ("de 1 a 100 caracteres"):
+
+```python
+from decimal import Decimal
+from pydantic import BaseModel, Field
+
+class LibroCrear(BaseModel):
+    titulo: str = Field(min_length=1, max_length=200)
+    paginas: int = Field(gt=0)                      # gt = greater than: > 0
+    precio: Decimal = Field(ge=0, max_digits=10, decimal_places=2)   # ge: >= 0; como numeric(10,2)
+```
+
+| Restricción | Para | Significa |
+|---|---|---|
+| `min_length` / `max_length` | textos, listas | longitud mínima / máxima |
+| `gt` / `ge` | números | mayor que / mayor o igual que |
+| `lt` / `le` | números | menor que / menor o igual que |
+| `max_digits` / `decimal_places` | `Decimal` | dígitos totales / decimales (como `numeric(10,2)`) |
+| `pattern` | textos | tiene que cumplir una expresión regular |
+
+- `Field(...)` va **en el lugar del valor por defecto**. Si además quieres un
+  valor por defecto: `Field(default=10, gt=0)`.
+- **¿Duplicar las reglas que ya tiene Postgres (`CHECK`, `NOT NULL`)?** Sí, y es
+  bueno: Postgres es la **última defensa** (lección 3); Pydantic da al cliente un
+  **422 con un mensaje claro** antes de llegar a la base de datos, en vez de un
+  error de Postgres que hay que traducir.
+
+#### d) Tipos especiales: `EmailStr`
+
+```python
+from pydantic import EmailStr
+
+class AutorCrear(BaseModel):
+    email: EmailStr          # valida que tenga forma de email (necesita email-validator, que viene con fastapi[standard])
+```
+
+#### e) Convertir un modelo a diccionario: `model_dump()`
+
+```python
+libro = LibroCrear(titulo="Ficciones", paginas=200)
+libro.model_dump()                     # {"titulo": "Ficciones", "subtitulo": None, "disponible": True, ...}
+libro.model_dump(exclude_unset=True)   # {"titulo": "Ficciones", "paginas": 200}  ← solo lo que se MANDÓ
+```
+
+`exclude_unset=True` deja fuera los campos que el cliente **no mandó** (aunque
+tengan valor por defecto). Será clave para el PATCH.
+
+---
+
+### 8.3 Varios modelos para un mismo recurso
+
+Lo normal es **no** usar un solo modelo para todo, sino uno por "dirección":
+
+| Modelo | Para | Qué campos |
+|---|---|---|
+| `LibroCrear` | **Entrada** del `POST` | Lo que el cliente **puede y debe** mandar. Sin `id` ni `creado_en`: los pone Postgres |
+| `LibroActualizar` | **Entrada** del `PATCH` | Los mismos, pero **todos opcionales** (se cambia solo lo que venga) |
+| `LibroLeer` | **Salida** de todos | Lo que el cliente **puede ver**: incluye `id` y `creado_en` |
+
+¿Por qué separarlos? Si el `POST` aceptara `id`, el cliente podría elegir el id
+(¡o intentar pisar otro!). Si la salida fuera "lo que haya en la tabla", el día
+que añadas una columna `password_hash` saldría en la API. **Cada modelo es un
+contrato**: esto es exactamente lo que entra y lo que sale.
+
+#### ¿Y `Mapped`? Dos tipos de "modelo" que se parecen mucho
+
+En proyectos con SQLAlchemy verás clases muy parecidas a estas, pero con
+`Mapped[...]`. **No son lo mismo**: la palabra "modelo" se usa para dos cosas.
+
+```python
+# models.py: modelo ORM (SQLAlchemy). Describe la TABLA de la base de datos
+class Usuario(Base):
+    __tablename__ = "usuarios"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(unique=True)
+    password_hash: Mapped[str]
+
+# schemas.py: modelo Pydantic. Describe el JSON que ENTRA o SALE de la API
+class UsuarioLeer(BaseModel):
+    id: int
+    email: str            # sin password_hash: no sale nunca en la API
+```
+
+| | Modelo ORM (`Mapped`) | Modelo Pydantic (`BaseModel`) |
+|---|---|---|
+| Librería | SQLAlchemy | Pydantic |
+| Describe | Una **tabla** (columnas, PK, FK...) | Un **JSON** de la API (entrada o salida) |
+| Sirve para | Leer y escribir filas **sin escribir SQL** | Validar lo que entra y filtrar lo que sale |
+| Cuántos por recurso | Normalmente **uno** (una tabla) | **Varios** (`Crear`, `Actualizar`, `Leer`...) |
+| Fichero habitual | `models.py` | `schemas.py` |
+
+**`Mapped[int]`** es una anotación de tipo de SQLAlchemy 2.x. Le dice: "este
+atributo es una columna, y en Python vale un `int`". Así el editor sabe que
+`usuario.id` es un `int`. `mapped_column(...)` añade los detalles de la
+columna (clave primaria, `unique`, `nullable`...).
+
+**Por qué no lo usamos aún:** nosotros hablamos con Postgres con **SQL a mano**
+(psycopg), así que la tabla ya está descrita en el `CREATE TABLE` y no
+necesitamos una clase ORM. Solo tenemos la capa de Pydantic. `Mapped` llega en
+la **lección 12**. Allí verás que en un proyecto con ORM conviven las dos capas:
+el endpoint lee un `Usuario` (ORM) de la base de datos y lo devuelve como
+`UsuarioLeer` (Pydantic) gracias a `model_config = ConfigDict(from_attributes=True)`.
+
+> ⚠️ **No uses el modelo ORM como respuesta de la API.** Sería volver al problema
+> de antes: la tabla tiene columnas (`password_hash`) que el cliente no debe ver.
+> (SQLModel intenta unir las dos capas en una sola clase; ya lo verás.)
+
+---
+
+### 8.4 Modelo de entrada: FastAPI lo lee del body
+
+```python
+@app.post("/libros")
+def crear_libro(libro: LibroCrear, conn: Conn):
+    ...
+```
+
+Ya sabíamos cómo decide FastAPI de dónde sale cada parámetro. Se añade una regla:
+
+| El parámetro... | Sale de |
+|---|---|
+| está en la ruta `{...}` | la ruta |
+| tiene `Depends` | una dependencia |
+| es un **modelo de Pydantic** (`BaseModel`) | el **body** (JSON) ← nuevo |
+| cualquier otro (`int`, `str`...) | la consulta `?...` |
+
+Dentro de la función, `libro` ya es un objeto `LibroCrear` **validado**:
+`libro.titulo` es un `str` de 1 a 200 caracteres, garantizado.
+
+**El 422 de un body** dice exactamente qué campo falla:
+
+```json
+{"detail": [{"type": "greater_than", "loc": ["body", "paginas"], "msg": "Input should be greater than 0", "input": -5}]}
+```
+
+(`"loc": ["body", "paginas"]` → en el body, campo `paginas`.)
+
+---
+
+### 8.5 Modelo de salida: `response_model`
+
+```python
+@app.get("/libros/{libro_id}", response_model=LibroLeer)
+def leer_libro(libro_id: int, conn: Conn):
+    ...
+    return libro          # un dict
+```
+
+`response_model=LibroLeer` le dice a FastAPI: "lo que devuelva esta función,
+**pásalo por `LibroLeer` antes de responder**". Eso hace tres cosas:
+
+1. **Filtra**: solo salen los campos del modelo. Si el `dict` trae columnas de
+   más, **se descartan**. Si un día haces `SELECT *` sin querer, no se escapa nada.
+2. **Valida**: si falta un campo o tiene el tipo equivocado → error **500**. Es un
+   bug **tuyo** (tu código no cumple su propio contrato) y prefieres enterarte.
+3. **Documenta**: `/docs` muestra la forma exacta de la respuesta.
+
+Para listas: `response_model=list[LibroLeer]`.
+
+**Cambio de formato que vas a notar:** con un modelo de Pydantic de por medio,
+`Decimal` sale en el JSON como **texto**: `"precio": "1883.95"` (antes salía
+`1883.95` como número). Pydantic lo hace a propósito para **no perder precisión**:
+un número JSON se suele leer como `float`, y con dinero no queremos `float`.
+
+---
+
+### 8.6 POST: crear (`INSERT ... RETURNING`)
+
+```python
+@app.post("/libros", response_model=LibroLeer, status_code=201)
+def crear_libro(libro: LibroCrear, conn: Conn):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            INSERT INTO libros (titulo, paginas, precio)
+            VALUES (%(titulo)s, %(paginas)s, %(precio)s)
+            RETURNING id, titulo, paginas, precio, creado_en
+        """, libro.model_dump())
+        return cur.fetchone()
+```
+
+| Línea | Qué hace |
+|---|---|
+| `@app.post(...)` | Responde a `POST /libros`. |
+| `status_code=201` | Si todo va bien, responde **201 Created** en vez de 200 (lección 6.1). |
+| `libro: LibroCrear` | El body, ya validado (8.4). |
+| `%(titulo)s` | **Marcador con nombre**: igual que `%s`, pero el valor se busca en un **diccionario** por su nombre. Seguro igual que `%s` (7.7). Con muchas columnas es mucho más legible que contar `%s`. |
+| `libro.model_dump()` | Convierte el modelo en `{"titulo": ..., "paginas": ..., "precio": ...}`: el diccionario de donde salen los `%(nombre)s`. |
+| `RETURNING id, ...` | Lección 3.8: el `INSERT` devuelve la fila creada, **con el `id` y el `creado_en` que ha generado Postgres**. Sin esto tendrías que hacer otro `SELECT` (y saber qué id le tocó). |
+| `return cur.fetchone()` | La fila creada (dict) → pasa por `LibroLeer` → JSON. |
+
+**Marcadores con nombre vs posicionales** (no se pueden mezclar en la misma consulta):
+
+```python
+cur.execute("... WHERE id = %s AND activo = %s", (5, True))                         # posición → tupla
+cur.execute("... WHERE id = %(id)s AND activo = %(activo)s", {"id": 5, "activo": True})  # nombre → dict
+```
+
+---
+
+### 8.7 PATCH: modificar solo lo que venga
+
+**`PUT` vs `PATCH`:**
+- `PUT /libros/5` → "**reemplaza** el libro 5 por este" → hay que mandar **todos** los campos.
+- `PATCH /libros/5` → "**cambia** estos campos del libro 5" → se manda **solo lo que cambia**.
+
+En la práctica `PATCH` es lo más usado para editar. El modelo de entrada tiene **todos los campos opcionales**:
+
+```python
+class LibroActualizar(BaseModel):
+    titulo: str | None = Field(default=None, min_length=1, max_length=200)
+    paginas: int | None = Field(default=None, gt=0)
+    precio: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+```
+
+**El SQL: `COALESCE` para "si no viene, deja lo que había"** (lección 4.5):
+
+```python
+@app.patch("/libros/{libro_id}", response_model=LibroLeer)
+def actualizar_libro(libro_id: int, cambios: LibroActualizar, conn: Conn):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            UPDATE libros SET
+                titulo  = COALESCE(%(titulo)s,  titulo),
+                paginas = COALESCE(%(paginas)s, paginas),
+                precio  = COALESCE(%(precio)s,  precio)
+            WHERE id = %(id)s
+            RETURNING id, titulo, paginas, precio, creado_en
+        """, {**cambios.model_dump(), "id": libro_id})
+        libro = cur.fetchone()
+    if libro is None:
+        raise HTTPException(status_code=404, detail="Libro no encontrado")
+    return libro
+```
+
+| Pieza | Qué hace |
+|---|---|
+| `COALESCE(%(titulo)s, titulo)` | Si el cliente mandó `titulo`, usa ese. Si no (`None` → `NULL`), `COALESCE` devuelve el segundo: la columna `titulo`, **su valor actual**. Es decir, no lo cambia. |
+| `{**cambios.model_dump(), "id": libro_id}` | `**` "desparrama" un diccionario dentro de otro: el resultado es `{"titulo": ..., "paginas": ..., "precio": ..., "id": 5}`. Así todos los marcadores tienen su valor. |
+| `RETURNING ...` + `fetchone()` | Si el id no existe, el `UPDATE` no toca ninguna fila → `RETURNING` no devuelve nada → `None` → 404. Una sola consulta para actualizar **y** saber si existía. |
+
+> ⚠️ **Limitación de `COALESCE`:** con este truco **no se puede poner una
+> columna a `NULL`** (un `null` se interpreta como "no lo cambies"). Para columnas
+> `NOT NULL` (como todas las nuestras) da igual. Si algún día lo necesitas, hay que
+> construir el `SET` solo con los campos de `model_dump(exclude_unset=True)`,
+> usando `psycopg.sql` para meter nombres de columnas de forma segura (los nombres
+> de columna **no** pueden ir en `%s`). Lo veremos si hace falta.
+
+---
+
+### 8.8 DELETE: borrar y responder `204`
+
+```python
+@app.delete("/libros/{libro_id}", status_code=204)
+def borrar_libro(libro_id: int, conn: Conn):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM libros WHERE id = %s", (libro_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Libro no encontrado")
+```
+
+| Pieza | Qué hace |
+|---|---|
+| `status_code=204` | **204 No Content**: "hecho, y no tengo nada que devolverte". Una respuesta 204 **no lleva body**. |
+| `cur.rowcount` | Cuántas filas tocó la última sentencia: es el número de `DELETE 1` que veías en `psql` (lección 3.8). `0` → no existía → 404. |
+| Sin `return` | La función devuelve `None` → FastAPI responde 204 sin cuerpo. |
+
+> ⚠️ Borrar un libro que tenga filas que lo referencien (una clave foránea, lección 4)
+> lanzará `ForeignKeyViolation` → **500**. En la lección 9 lo convertiremos en un **409 Conflict**.
+
+---
+
+### 8.9 Que el `COMMIT` ocurra **antes** de responder: `scope="function"`
+
+Ahora que **escribimos**, importa **cuándo** se hace el `COMMIT`. Recuerda que lo
+hace `get_conn` al salir del `with pool.connection()` (7.5), es decir, en la parte
+**después del `yield`**.
+
+**Por defecto, FastAPI ejecuta lo de después del `yield` cuando la respuesta ya
+se ha enviado al cliente.** Comprobado en el curso con una dependencia cuyo
+"después del yield" fallaba a propósito (simulando un `COMMIT` que falla):
+
+```
+sin scope:              201 {"ok": true}           ← el cliente cree que se guardó... y no
+scope="function":       500 Internal Server Error   ← el cliente se entera del fallo
+```
+
+El `COMMIT` puede fallar (se cae la conexión, un conflicto con otra transacción...).
+Si ya respondiste "201 Creado", **le has mentido al cliente**. Solución: decirle a
+FastAPI que cierre la dependencia **en cuanto termine la función del endpoint,
+antes de enviar la respuesta**:
+
+```python
+Conn = Annotated[Connection, Depends(get_conn, scope="function")]
+```
+
+| `scope` | Lo de después del `yield` se ejecuta... |
+|---|---|
+| `"request"` (por defecto) | **después** de enviar la respuesta |
+| `"function"` | al terminar el endpoint, **antes** de enviar la respuesta |
+
+> 💡 Para dependencias que hacen `COMMIT`, `scope="function"`. La respuesta
+> solo debe salir cuando los datos están **de verdad** guardados.
+
+---
+
+### 8.10 Permisos: la API ahora necesita escribir
+
+`api_curso` solo tiene `SELECT` (lección 2). Un `INSERT` desde la API daría
+`permission denied for table usuarios` → `psycopg.errors.InsufficientPrivilege` → **500**.
+
+Hay que darle (como `postgres`) **exactamente** lo que vaya a usar, tabla a tabla:
+`INSERT` (`a`), `UPDATE` (`w`), `DELETE` (`d`). Mínimo privilegio: si un endpoint
+no borra pedidos, el rol no necesita `DELETE` sobre `pedidos`.
+
+Con `GENERATED ... AS IDENTITY` no hace falta permiso sobre la secuencia (lección 3.4).
+
 
 ---
 
