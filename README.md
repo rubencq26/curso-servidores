@@ -695,8 +695,44 @@ host     all           all       all             scram-sha-256
 | Conexión | Regla que encaja | ¿Contraseña? |
 |---|---|---|
 | `docker exec ... psql -U postgres` (socket) | `local all all trust` | No |
-| `docker exec ... psql "postgresql://api_curso:...@localhost..."` | `host ... ::1/128 trust` | **No** (aunque pongas una mal, entra) |
+| `docker exec ... psql "postgresql://api_curso:...@localhost..."` | `host ... 127.0.0.1/32 trust` (o `::1/128`) | **No** (aunque pongas una mal, entra) |
+| `docker exec ... psql "postgresql://api_curso:...@$(hostname -i)..."` | Origen = IP del propio contenedor (`172.x.x.x`) → última regla | **Sí** |
 | Desde WSL / tu API, por el puerto 5432 mapeado | Llega desde la red de Docker (`172.x.x.x`) → última regla, `scram-sha-256` | **Sí** |
+
+#### "¿Pero si me he conectado por TCP y no por socket?"
+
+Es la confusión típica (le pasó a Rubén: entró con `api12354` en vez de
+`api1234`). Que la conexión sea TCP solo descarta las reglas `local`. Después,
+Postgres sigue mirando **la IP de origen**, y ahí está la trampa:
+
+```
+docker exec -it curso-postgres psql "postgresql://...@localhost:5432/curso"
+└──────────┬─────────────────┘                      └───┬───┘
+  psql corre DENTRO del contenedor          "localhost" = el propio contenedor
+                                            → la conexión llega desde 127.0.0.1
+                                            → regla "host all all 127.0.0.1/32 trust"
+                                            → trust: la contraseña NI SE MIRA
+```
+
+`localhost` no significa "mi portátil", sino **"la máquina donde se ejecuta el
+programa"**. Con `docker exec`, el programa (`psql`) se ejecuta dentro del
+contenedor, así que `localhost` es el contenedor.
+
+**Cómo comprobar que la contraseña sí se valida:** conéctate desde un origen que
+no sea `127.0.0.1`. Por ejemplo, dentro del contenedor pero usando su IP de
+red (`hostname -i` la imprime):
+
+```bash
+docker exec -it curso-postgres sh -c 'psql "postgresql://api_curso:malapass@$(hostname -i):5432/curso"'
+# FATAL:  password authentication failed for user "api_curso"   ← ahora sí la comprueba
+```
+
+O desde WSL con tu API/psycopg por el puerto 5432 mapeado: con una contraseña
+mala en el `.env`, la API no arranca.
+
+> 💡 **Regla para recordar:** `trust` = "me fío de quien venga de aquí, no
+> compruebo nada". Que te deje entrar con una contraseña mala **no** significa
+> que la contraseña esté bien: significa que nadie la ha mirado.
 
 > 💡 La imagen oficial de Docker confía en todo lo que viene **de dentro** del
 > contenedor y pide contraseña a todo lo que viene **de fuera**. Para desarrollo
@@ -708,7 +744,9 @@ host     all           all       all             scram-sha-256
 
 ```bash
 # ver las reglas activas del contenedor (sin comentarios ni líneas vacías)
-docker exec curso-postgres sh -c 'grep -v "^#" /var/lib/postgresql/data/pg_hba.conf | grep -v "^$"'
+docker exec curso-postgres sh -c 'grep -v "^#" "$PGDATA/pg_hba.conf" | grep -v "^$"'
+# $PGDATA = carpeta de datos de Postgres dentro del contenedor (comillas simples
+# por fuera → la variable la expande el shell del contenedor, no el tuyo)
 ```
 
 ### 2.9 🧭 Chuleta para el primer día: explorar un Postgres que te dan
@@ -2889,7 +2927,99 @@ def leer_libro(libro_id: int, conn: Conn):
    bug **tuyo** (tu código no cumple su propio contrato) y prefieres enterarte.
 3. **Documenta**: `/docs` muestra la forma exacta de la respuesta.
 
-Para listas: `response_model=list[LibroLeer]`.
+#### #### El **filtro** manda: si un campo no está en el `response_model`, no sale
+
+El paso 1 (filtrar) funciona **siempre**, aunque tu función devuelva más datos.
+Error típico (le pasó a Rubén en el ejercicio 4) → poner el modelo de **entrada**
+como modelo de **salida**:
+
+```python
+@app.post("/usuarios", response_model=UsuarioCrear, status_code=201)   # ❌ modelo de ENTRADA
+def crear_usuario(usuario: UsuarioCrear, conn: Conn):
+    ...
+    # el INSERT ... RETURNING devuelve:  {"id": 8, "nombre": "Juan", "email": "...", "creado_en": ...}
+    # UsuarioCrear solo tiene nombre y email → FastAPI tira lo demás
+    # el cliente recibe:                 {"nombre": "Juan", "email": "juan@mail.com"}
+```
+
+No da error: el `dict` **tiene** `nombre` y `email`, así que cumple el
+contrato de `UsuarioCrear`. Los campos de más se descartan en silencio. Por eso
+cuesta verlo: parece que Postgres no ha devuelto el `id`, pero sí lo ha
+devuelto, y se ha perdido en el filtro.
+
+**Regla:** en el decorador va el modelo de **salida** (`...Leer`); en el
+parámetro de la función, el de **entrada** (`...Crear` / `...Actualizar`).
+
+```python
+@app.post("/usuarios", response_model=UsuarioLeer, status_code=201)   # sale: UsuarioLeer
+def crear_usuario(usuario: UsuarioCrear, conn: Conn):                 # entra: UsuarioCrear
+```
+
+Y el `RETURNING` tiene que traer **todos** los campos de `UsuarioLeer`. Si falta
+uno (por ejemplo `activo`), ya no es un filtro, sino un contrato roto → **500**.
+
+| Lo que devuelve tu función respecto al `response_model` | Resultado |
+|---|---|
+| Tiene campos **de más** | Se quitan en silencio → 200/201 |
+| Le **falta** un campo obligatorio | `ResponseValidationError` → **500** |
+
+**Cómo se ve en la terminal** (comprobado: `UsuarioLeer` con `activo` y un
+`RETURNING id, nombre, email, creado_en` sin `activo`):
+
+```
+fastapi.exceptions.ResponseValidationError: 1 validation error:
+  {'type': 'missing', 'loc': ('response', 'activo'), 'msg': 'Field required',
+   'input': {'id': 11, 'nombre': 'Prueba', 'email': '...', 'creado_en': ...}}
+```
+
+| Trozo | Qué te dice |
+|---|---|
+| `ResponseValidationError` | Ha fallado la **respuesta** (tu código), no lo que mandó el cliente |
+| `'loc': ('response', 'activo')` | En la respuesta, el campo `activo`. Compáralo con el 422, donde `loc` empieza por `'body'` |
+| `'type': 'missing'` | No está |
+| `'input': {...}` | Lo que devolvió tu función: aquí ves que le falta `activo` |
+
+Es el "espejo" del 422: el **422** es "cliente, lo que me mandas no cumple el
+contrato"; este **500** es "programador, lo que devuelves no cumple el contrato".
+
+**¿Se guardó la fila?** No (comprobado). Con `scope="function"` (8.9), la
+respuesta se valida **antes** de que `get_conn` haga el `COMMIT`. La excepción
+llega hasta el `with pool.connection()` → **`ROLLBACK`**. Justo lo que queremos:
+si la API responde error, no se ha guardado nada a medias.
+
+> 💡 **Pero el `id` sí se gasta.** En la prueba, el `INSERT` deshecho se llevó el
+> `id` 11, y el siguiente usuario será el 12, no el 11. Las secuencias de
+> `IDENTITY` **no** vuelven atrás con el `ROLLBACK` (así dos transacciones a la vez
+> nunca reciben el mismo número). Los huecos en los ids son normales: **nunca**
+> cuentes con que los ids sean consecutivos.
+
+#### Para devolver **varios**: `list[...]`
+
+Un modelo describe **un** objeto. Si el endpoint devuelve muchos (un listado),
+el JSON es una **lista** de esos objetos, y así se declara:
+
+```python
+@app.get("/libros", response_model=list[LibroLeer])
+def listar_libros(conn: Conn):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id, titulo, paginas, precio, creado_en FROM libros ORDER BY id")
+        return cur.fetchall()          # lista de dicts
+```
+
+| Endpoint | Devuelve | `fetch...` | `response_model` |
+|---|---|---|---|
+| `GET /libros` | **una lista** de libros | `fetchall()` → `list[dict]` | `list[LibroLeer]` |
+| `GET /libros/{id}` | **un** libro | `fetchone()` → `dict` | `LibroLeer` |
+
+- `list[LibroLeer]` se lee "lista de `LibroLeer`". Es la misma sintaxis de tipos
+  que `list[int]` o `str | None`: los corchetes dicen **de qué** es la lista.
+- FastAPI pasa **cada elemento** por `LibroLeer` (filtra, valida y convierte uno a uno).
+- Una tabla vacía devuelve `[]`, y eso es válido: una lista vacía sigue siendo una
+  lista de `LibroLeer`. **No** es un 404: "no hay libros" es una respuesta correcta.
+- **No hace falta un modelo nuevo** tipo `LibrosLeer`: el modelo describe una fila
+  y `list[...]` dice que vienen varias.
+- Si te equivocas y pones `response_model=LibroLeer` con `fetchall()`, FastAPI
+  intenta meter una lista donde espera un objeto → **500** (`ResponseValidationError`).
 
 **Cambio de formato que vas a notar:** con un modelo de Pydantic de por medio,
 `Decimal` sale en el JSON como **texto**: `"precio": "1883.95"` (antes salía
@@ -2920,7 +3050,36 @@ def crear_libro(libro: LibroCrear, conn: Conn):
 | `%(titulo)s` | **Marcador con nombre**: igual que `%s`, pero el valor se busca en un **diccionario** por su nombre. Seguro igual que `%s` (7.7). Con muchas columnas es mucho más legible que contar `%s`. |
 | `libro.model_dump()` | Convierte el modelo en `{"titulo": ..., "paginas": ..., "precio": ...}`: el diccionario de donde salen los `%(nombre)s`. |
 | `RETURNING id, ...` | Lección 3.8: el `INSERT` devuelve la fila creada, **con el `id` y el `creado_en` que ha generado Postgres**. Sin esto tendrías que hacer otro `SELECT` (y saber qué id le tocó). |
-| `return cur.fetchone()` | La fila creada (dict) → pasa por `LibroLeer` → JSON. |
+| `return cur.fetchone()` | La fila creada (dict) → pasa por `LibroLeer` → JSON. **Va dentro del `with`** (ver abajo). |
+
+> ⚠️ **`fetchone()` / `fetchall()` siempre DENTRO del `with conn.cursor()`.**
+> Al salir del bloque `with`, el cursor **se cierra**, y con él los resultados
+> que tenía guardados. Si lees después, falla (comprobado en el curso):
+>
+> ```python
+> with conn.cursor(row_factory=dict_row) as cur:
+>     cur.execute("INSERT ... RETURNING ...", datos)
+> return cur.fetchone()      # ❌ fuera del with → cursor cerrado
+> # psycopg.InterfaceError: the cursor is closed   → 500
+> ```
+>
+> El cliente solo ve `500 Internal Server Error`. **La causa real está siempre en
+> la terminal de `fastapi dev`**: busca la última línea del traceback (el error) y
+> la línea de **tu** fichero (`File ".../main.py", line 64`).
+>
+> Dos formas correctas: hacer `return` dentro del `with`, o guardar el
+> resultado en una variable dentro y usarla fuera (como en el PATCH de 8.7):
+>
+> ```python
+> with conn.cursor(row_factory=dict_row) as cur:
+>     cur.execute(...)
+>     usuario = cur.fetchone()   # ✅ se lee con el cursor abierto
+> return usuario                 # ✅ la variable es un dict normal, ya no depende del cursor
+> ```
+>
+> **¿Se guardó la fila?** No. La excepción sube hasta `get_conn`; el
+> `with pool.connection()` ve un error y hace **`ROLLBACK`** en vez de `COMMIT`. El
+> `INSERT` se deshace, así que puedes repetir la petición con el mismo email.
 
 **Marcadores con nombre vs posicionales** (no se pueden mezclar en la misma consulta):
 
@@ -2928,6 +3087,28 @@ def crear_libro(libro: LibroCrear, conn: Conn):
 cur.execute("... WHERE id = %s AND activo = %s", (5, True))                         # posición → tupla
 cur.execute("... WHERE id = %(id)s AND activo = %(activo)s", {"id": 5, "activo": True})  # nombre → dict
 ```
+
+**Anatomía de un marcador con nombre:** `%(activo)s` tiene **tres** partes, y
+la `s` del final **es obligatoria**:
+
+```
+%(activo)s
+│└──┬───┘└─ formato: s = "lo que sea, psycopg se encarga del tipo" (usa siempre s)
+│   └────── nombre: la clave del diccionario
+└────────── empieza un marcador
+```
+
+Error típico (le pasó a Rubén en el PATCH): olvidar la `s` → `%(activo)`.
+psycopg lo detecta **antes** de mandar nada a Postgres (comprobado):
+
+```
+psycopg.ProgrammingError: only '%s', '%b', '%t' are allowed as placeholders, got '%(activo),'
+```
+
+Se lee: "después de `%(activo)` esperaba `s` (o `b`/`t`, formatos binario/texto
+que no vas a necesitar), y lo que he encontrado es una `,`". El `got '...'` te
+enseña **el trozo exacto** del SQL donde está el fallo: búscalo en tu consulta.
+Como pasa antes de tocar la base de datos, no se cambia nada → **500** sin efectos.
 
 ---
 
@@ -3047,6 +3228,90 @@ Hay que darle (como `postgres`) **exactamente** lo que vaya a usar, tabla a tabl
 no borra pedidos, el rol no necesita `DELETE` sobre `pedidos`.
 
 Con `GENERATED ... AS IDENTITY` no hace falta permiso sobre la secuencia (lección 3.4).
+
+En nuestro contenedor ya está hecho. `\dp` muestra `api_curso=arwd/postgres` en
+`usuarios` y `pedidos`: `a`=INSERT, `r`=SELECT, `w`=UPDATE, `d`=DELETE.
+
+---
+
+### 8.11 ✏️ Ejercicios de la lección 8
+
+Hasta ahora todo era con `libros` de ejemplo. Ahora te toca hacerlo de verdad sobre
+**nuestras tablas**, `usuarios` y `pedidos` (lección 4.5). Tú escribes el código y
+Claude lo revisa. Pruébalo todo con `curl -i` o en `/docs`.
+
+Recordatorio de las tablas:
+
+```
+usuarios: id (identity) · nombre text NOT NULL · email text NOT NULL UNIQUE · activo bool DEFAULT true · creado_en timestamptz DEFAULT now()
+pedidos:  id (identity) · usuario_id int NOT NULL → usuarios(id) · producto text NOT NULL · importe numeric(10,2) NOT NULL CHECK >= 0 · creado_en timestamptz DEFAULT now()
+```
+
+**Ejercicio 1: `scope="function"` (8.9)**
+Cambia `Conn` en `db.py` para que el `COMMIT` ocurra antes de responder.
+
+**Ejercicio 2: `schemas.py` con los modelos Pydantic (8.2 y 8.3)**
+Crea un fichero nuevo `schemas.py` con:
+
+| Modelo | Campos |
+|---|---|
+| `UsuarioCrear` | `nombre` (1–100 caracteres), `email` (`EmailStr`) |
+| `UsuarioActualizar` | `nombre`, `email`, `activo`, **todos opcionales** |
+| `UsuarioLeer` | `id`, `nombre`, `email`, `activo`, `creado_en` (tipo: `datetime`, de `from datetime import datetime`) |
+| `PedidoCrear` | `producto` (1–200 caracteres), `importe` (`Decimal`, `>= 0`, como `numeric(10,2)`) |
+| `PedidoLeer` | `id`, `usuario_id`, `producto`, `importe`, `creado_en` |
+
+Pregunta: ¿por qué `UsuarioCrear` no tiene `activo`? ¿Debería tenerlo?
+
+**Ejercicio 3: `response_model` en los GET que ya tienes (8.5)**
+Ponle `response_model` a `GET /usuarios`, `GET /usuarios/{id}` y
+`GET /usuarios/{id}/pedidos`. Los dos primeros no devuelven `creado_en` y
+`UsuarioLeer` sí lo exige: ¿qué pasa si no lo añades al `SELECT`? Pruébalo antes
+de arreglarlo y fíjate en qué código HTTP sale y **de quién es la culpa**.
+
+**Ejercicio 4: `POST /usuarios` → 201 (8.6)**
+Pruébalo con:
+1. Un usuario correcto. Comprueba en la respuesta que vienen `id`, `activo` y `creado_en`.
+2. `"email": "esto-no-es-un-email"` → ¿qué código? ¿Qué dice `loc`?
+3. `"nombre": ""` → ídem.
+4. Un email que **ya existe** (`luis@mail.com`) → ¿qué código sale? Mira la
+   terminal de `fastapi dev`: ¿qué excepción de psycopg aparece? (Se arregla en la
+   lección 9, de momento solo **obsérvalo**).
+5. Manda un campo de más: `{"nombre": "X", "email": "x@mail.com", "id": 999}`.
+   ¿Se queja? ¿Qué `id` le pone Postgres?
+
+**Ejercicio 5: `PATCH /usuarios/{id}` (8.7)**
+Pruébalo con:
+1. `{"activo": false}` → solo cambia `activo`.
+2. `{}` → ¿qué devuelve? ¿Ha cambiado algo?
+3. Un id que no existe → 404.
+4. `{"nombre": ""}` → 422.
+5. `{"email": "marta@mail.com"}` sobre **otro** usuario → ¿qué pasa? (Lo mismo que en 4.4.)
+
+**Ejercicio 6: `DELETE /usuarios/{id}` → 204 (8.8)**
+1. Crea un usuario con el POST y bórralo → 204, sin body.
+2. Bórralo otra vez → 404.
+3. Intenta borrar a Luis (tiene pedidos) → ¿qué código? ¿Qué excepción sale en la terminal?
+
+**Ejercicio 7: `POST /usuarios/{usuario_id}/pedidos` → 201**
+Crear un pedido **para un usuario**. Es un recurso anidado: el `usuario_id` viene
+de la **ruta**, no del body, así que `PedidoCrear` no lo lleva.
+1. Un pedido correcto para Luis.
+2. `"importe": -5` → ¿quién lo para, Pydantic o Postgres? ¿Cómo lo sabes?
+3. `"importe": 10.999` → ¿y esto?
+4. Para un usuario que **no existe** (`/usuarios/999/pedidos`) → ¿qué sale?
+   Piensa cómo lo convertirías en un 404 con lo que ya sabes (pista: el
+   `GET /usuarios/{id}/pedidos` que ya tienes).
+
+**🎯 Bonus: prohibir campos de más**
+En el ejercicio 4.5 habrás visto que Pydantic **ignora** los campos que no
+conoce. Busca en la documentación de Pydantic `ConfigDict(extra=...)` y haz
+que `UsuarioCrear` responda **422** si le mandan un campo que no existe.
+¿Por qué podría interesar esto? ¿Y por qué podría molestar?
+
+> 💡 Apunta los códigos y las excepciones que veas en los ejercicios 4.4, 5.5, 6.3
+> y 7.4. Son justo lo que arreglaremos en la **lección 9**: pasar de "500 y un
+> traceback" a errores HTTP con sentido (409, 404...).
 
 
 ---

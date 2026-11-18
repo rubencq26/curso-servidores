@@ -11,4 +11,4 @@ def get_conn():
     with pool.connection() as conn:
         yield conn
 
-Conn = Annotated[Connection, Depends(get_conn)]
+Conn = Annotated[Connection, Depends(get_conn, scope="function")]
