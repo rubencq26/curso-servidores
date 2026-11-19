@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from db import pool, Conn
 from psycopg.rows import dict_row
 from schemas import UsuarioCrear, UsuarioActualizar, UsuarioLeer, PedidoCrear, PedidoLeer
+from psycopg import errors
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,33 +50,69 @@ def get_pedido_usuario(usuario_id: int, conn: Conn):
     if usuario is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
     with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT id, usuario_id producto, importe, creado_en FROM pedidos WHERE usuario_id = %s ORDER BY id", (usuario_id,))
+        cur.execute("SELECT id, usuario_id, producto, importe, creado_en FROM pedidos WHERE usuario_id = %s ORDER BY id", (usuario_id,))
         pedidos = cur.fetchall()
     return pedidos
 
 @app.post("/usuarios", response_model=UsuarioLeer, status_code=201)
 def crear_usuario(usuario: UsuarioCrear, conn: Conn):
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("""
-            INSERT INTO usuarios (nombre, email)
-            VALUES (%(nombre)s, %(email)s)
-            RETURNING id, nombre, email, activo, creado_en;
-        """, usuario.model_dump())
-        usuario = cur.fetchone()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                INSERT INTO usuarios (nombre, email)
+                VALUES (%(nombre)s, %(email)s)
+                RETURNING id, nombre, email, activo, creado_en;
+            """, usuario.model_dump())
+            usuario = cur.fetchone()
+    except errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
     return usuario
 
 @app.patch("/usuarios/{usuario_id}", response_model=UsuarioLeer)
 def actualizar_usuario(usuario_id: int, usuario: UsuarioActualizar, conn: Conn):
+    try:  
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                UPDATE usuarios SET
+                    nombre = COALESCE(%(nombre)s, nombre),
+                    email = COALESCE(%(email)s, email),
+                    activo = COALESCE(%(activo)s, activo)
+                WHERE id = %(id)s
+                RETURNING id, nombre, email, activo, creado_en
+            """, {**usuario.model_dump(), "id": usuario_id})
+            usuario = cur.fetchone()
+    except errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="Ya existe un usaurio con ese email")
+    if usuario is None:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")  
+    return usuario
+
+@app.post("/usuarios/{usuario_id}/pedidos", response_model=PedidoLeer,status_code=201)
+def crear_pedido(usuario_id: int, pedido: PedidoCrear, conn: Conn):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
-            UPDATE usuarios SET
-                nombre = COALESCE(%(nombre)s, nombre),
-                email = COALESCE(%(email)s, email),
-                activo = COALESCE(%(activo)s, activo)
-            WHERE id = %(id)s
-            RETURNING id, nombre, email, activo, creado_en
-        """, {**usuario.model_dump(), "id": usuario_id})
+            SELECT 1 FROM usuarios WHERE id = %s;
+        """, (usuario_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        cur.execute("""
+            INSERT INTO pedidos (usuario_id, producto, importe) VALUES
+            (%(usuario_id)s, %(producto)s, %(importe)s)
+            RETURNING id, usuario_id, producto, importe, creado_en;
+        """, {**pedido.model_dump(), "usuario_id":usuario_id})
+        producto = cur.fetchone()
+    return producto
+
+@app.delete("/usuarios/{id}", response_model=UsuarioLeer)
+def borrar_usuario(id: int, conn: Conn):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            DELETE FROM usuarios WHERE id = %s 
+            RETURNING id, nombre, email, activo, creado_en;
+        """, (id,))
         usuario = cur.fetchone()
     if usuario is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
     return usuario
+        
+

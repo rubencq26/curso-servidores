@@ -3,7 +3,7 @@
 > Apuntes del curso. Cada lección añade una sección. Yo (Rubén) escribo el código;
 > Claude revisa y explica.
 
-**Entorno:** WSL2 (Ubuntu 24.04) · Python 3.12 · PostgreSQL en **Docker** (Docker Desktop en Windows)
+**Entorno:** WSL2 (Ubuntu 24.04) · Python 3.14 (el del `.venv`) · PostgreSQL en **Docker** (Docker Desktop en Windows)
 
 ---
 
@@ -18,8 +18,8 @@
 | 5 | Proyecto Python: entorno virtual, dependencias, variables de entorno | ✅ |
 | 6 | FastAPI: primer endpoint, rutas, Swagger (`/docs`) | ✅ |
 | 7 | Conectar FastAPI con PostgreSQL (pool de conexiones) | ✅ |
-| 8 | CRUD completo con Pydantic (validación de entrada/salida) | ⏳ en curso |
-| 9 | Errores, códigos HTTP y paginación | ⬜ |
+| 8 | CRUD completo con Pydantic (validación de entrada/salida) | ✅ (falta la errata `lenght`, ver 8.12) |
+| 9 | Errores, códigos HTTP y paginación | ⏳ en curso |
 | 10 | Seguridad básica: SQL injection, credenciales, usuario de solo-lectura | ⬜ |
 | 11 | Trabajar contra un Postgres que **ya existe** (el caso del trabajo) | ⬜ |
 | 12 | SQLAlchemy: query builder y ORM (y migraciones con Alembic) | ⬜ |
@@ -2549,9 +2549,14 @@ usuarios[0].nombre                                    # objetos, no diccionarios
 
 ```python
 cur.execute("... WHERE id = %s", (usuario_id))    # → TypeError: object of type 'int' has no len()
+cur.execute("... WHERE id = %s", usuario_id)      # → el mismo error (salió otra vez en la lección 8)
+cur.execute("... WHERE id = %s", (usuario_id,))   # ✅
 ```
 
 psycopg intenta contar los parámetros con `len()` y recibe un `int` suelto.
+**Regla fija:** el segundo argumento de `execute` es **siempre** una tupla
+(`%s`) o un diccionario (`%(nombre)s`), **aunque sea un solo valor**. Si ves
+`has no len()` en un `execute`, mira ese segundo argumento.
 
 **En SQL se compara con `=`, no con `==`.** `WHERE id == %s` → error de Postgres
 (`operator does not exist`). Python y SQL se mezclan en el mismo fichero: ojo
@@ -2816,6 +2821,19 @@ libro.model_dump(exclude_unset=True)   # {"titulo": "Ficciones", "paginas": 200}
 
 `exclude_unset=True` deja fuera los campos que el cliente **no mandó** (aunque
 tengan valor por defecto). Será clave para el PATCH.
+
+> ⚠️ **Con paréntesis: `model_dump()`.** Sin ellos, `libro.model_dump` no
+> **llama** al método, solo lo **nombra** (es la función en sí, no su
+> resultado). Error real del curso (comprobado):
+>
+> ```python
+> {**pedido.model_dump, "usuario_id": 5}     # ❌ TypeError: 'method' object is not a mapping
+> {**pedido.model_dump(), "usuario_id": 5}   # ✅ primero se llama → dict → se desparrama
+> ```
+>
+> `'method' object is not a mapping` = "me has dado un método y yo esperaba un
+> diccionario". Si en un error ves `'method'` o `'function'` donde esperabas un
+> valor, casi siempre faltan unos `()`.
 
 ---
 
@@ -3179,6 +3197,41 @@ def borrar_libro(libro_id: int, conn: Conn):
 | `cur.rowcount` | Cuántas filas tocó la última sentencia: es el número de `DELETE 1` que veías en `psql` (lección 3.8). `0` → no existía → 404. |
 | Sin `return` | La función devuelve `None` → FastAPI responde 204 sin cuerpo. |
 
+**¿204 o 200?** Las dos son "ha ido bien" (todo lo que empieza por **2** es éxito). La
+diferencia es **si devuelves algo**:
+
+| Opción | Cuándo | Cómo |
+|---|---|---|
+| **204 No Content** ✅ lo habitual | No devuelves nada: "borrado, no hay más que decir" | `status_code=204`, sin `return` |
+| **200 OK** | Devuelves algo, por ejemplo la fila que se acaba de borrar (`DELETE ... RETURNING ...`) | `response_model=LibroLeer`, con `return` |
+
+Si no pones `status_code`, FastAPI responde **200** con body `null`, que funciona
+pero es raro: un 200 promete contenido y no hay. Si no devuelves nada, usa **204**.
+
+> ⚠️ **No mezcles las dos opciones.** `response_model=...` + `status_code=204`
+> es una contradicción ("devuelve esta forma" + "no devuelvas nada"), y FastAPI se
+> niega a **arrancar** (comprobado en el ejercicio 6):
+>
+> ```
+> AssertionError: Status code 204 must not have a response body
+> ```
+>
+> Ojo: no falla al llamar al endpoint, falla al **arrancar la app** (al registrar
+> la ruta). Con `fastapi dev`, el servidor se queda caído y **ningún** endpoint
+> responde. Si tras guardar un cambio todo deja de contestar, mira la terminal.
+>
+> Elige una: o `status_code=204` sin `response_model` ni `RETURNING`, o
+> `response_model=UsuarioLeer` con 200 y `RETURNING`.
+
+**Chuleta de códigos de éxito del CRUD:**
+
+| Operación | Método | Éxito |
+|---|---|---|
+| Leer uno / listar | `GET` | **200** + el recurso / la lista |
+| Crear | `POST` | **201 Created** + lo creado |
+| Modificar | `PATCH` | **200** + cómo ha quedado |
+| Borrar | `DELETE` | **204 No Content**, sin body |
+
 > ⚠️ Borrar un libro que tenga filas que lo referencien (una clave foránea, lección 4)
 > lanzará `ForeignKeyViolation` → **500**. En la lección 9 lo convertiremos en un **409 Conflict**.
 
@@ -3313,6 +3366,694 @@ que `UsuarioCrear` responda **422** si le mandan un campo que no existe.
 > y 7.4. Son justo lo que arreglaremos en la **lección 9**: pasar de "500 y un
 > traceback" a errores HTTP con sentido (409, 404...).
 
+---
+
+### 8.12 Resultado de los ejercicios (revisión)
+
+Todos los casos se han probado contra la API (19-11-2026):
+
+| Caso | Resultado | ¿Bien? |
+|---|---|---|
+| 4.1 POST correcto | 201 + `id`, `activo`, `creado_en` | ✅ |
+| 4.2 email inválido | 422, `loc: ["body","email"]` | ✅ |
+| 4.3 `nombre: ""` | 422, `string_too_short` | ✅ |
+| 4.4 email repetido | **500** · `UniqueViolation` | ⏳ lección 9 → **409** |
+| 4.5 campo de más (`"id": 999`) | 201, el `id` se **ignora** (lo pone Postgres) | ✅ (bonus: `extra="forbid"`) |
+| 5.1 `{"activo": false}` | 200, solo cambia `activo` | ✅ |
+| 5.2 `{}` | 200, no cambia nada | ✅ |
+| 5.3 id que no existe | 404 | ✅ |
+| 5.4 `{"nombre": ""}` | 1ª vuelta: **200 y nombre vacío** · 2ª: sigue igual (errata `lenght`, ver abajo) | ❌ → arreglar |
+| 5.x `{"email": "no-es-email"}` | 1ª vuelta: **200 y email inválido** · 2ª: 422 (`EmailStr`) | ✅ |
+| 5.5 email de otro usuario | **500** · `UniqueViolation` | ⏳ lección 9 → **409** |
+| 6 DELETE | 1ª vuelta: la app **no arranca** (`response_model` + 204) · 2ª: **200** + el usuario borrado; repetido → 404 | ✅ (opción "200 + lo borrado") |
+| 6.3 borrar a Luis (tiene pedidos) | **500** · `ForeignKeyViolation` | ⏳ lección 9 → **409** |
+| 7.1 pedido correcto | 201, `importe: "12.50"` | ✅ |
+| 7.2 `importe: -5` | 422 `greater_than_equal` (Pydantic) | ✅ |
+| 7.3 `importe: 10.999` | 422 `decimal_max_places` (Pydantic) | ✅ |
+| 7.x `producto: ""` | 1ª vuelta: **201 con producto vacío** · 2ª: 422 | ✅ |
+| 7.4 usuario que no existe | 404 (gracias al `SELECT 1` previo) | ✅ |
+
+**Lección de los ❌ (5.4, 5.x y 7.x): el modelo de entrada del PATCH necesita las
+mismas reglas que el del POST.** `UsuarioActualizar` tenía `nombre: str | None` y
+`email: str | None` sin `Field` ni `EmailStr`. Así que lo que el POST rechaza, el
+PATCH lo deja pasar: basta con crear un usuario bien y luego "editarlo" mal.
+Postgres tampoco lo para: `NOT NULL` no impide un texto vacío `''` (no es `NULL`).
+
+```python
+class UsuarioActualizar(BaseModel):
+    nombre: str | None = Field(default=None, min_length=1, max_length=100)
+    email: EmailStr | None = None
+    activo: bool | None = None
+```
+
+> 💡 Regla: cada campo tiene **las mismas reglas** en todos los modelos de
+> entrada donde aparece. En `...Actualizar` solo cambia que es opcional.
+
+**Segunda vuelta del arreglo: dos trampas de `Field`** (comprobadas). El primer
+intento fue:
+
+```python
+nombre: str | None = Field(min_lenght=1, max_lenght=100)    # ❌ dos fallos
+```
+
+| Fallo | Qué pasa | Por qué |
+|---|---|---|
+| Falta `default=None` | `PATCH {"activo": false}` → **422 `missing` `nombre`**: el campo se ha vuelto **obligatorio** | `Field(...)` ocupa el sitio del valor por defecto (8.2c). Si no le pasas `default=`, el campo **no tiene** valor por defecto → obligatorio. `str \| None` solo dice que *puede* valer `null`, no que pueda faltar (8.2b) |
+| `lenght` en vez de `length` | `PATCH {"nombre": ""}` → **200** y nombre vacío: la regla **no se aplica** | `Field` no da error con un nombre que no conoce: lo guarda como dato extra y lo ignora. Solo avisa con un *warning* al arrancar: `PydanticDeprecatedSince20: Using extra keyword arguments on Field is deprecated... (Extra keys: 'min_lenght', 'max_lenght')` |
+
+> 💡 Si en el arranque de `fastapi dev` aparece `Extra keys: '...'`, tienes una
+> errata en un `Field`. Y **prueba siempre el caso que la regla debería parar**:
+> que el caso bueno funcione no demuestra que la regla exista.
+
+**Cómo se ve un 422 frente a un 500 en los ejercicios:**
+- **422**: lo para **Pydantic**, antes de ejecutar tu función. El body dice
+  qué campo y por qué. No se toca la base de datos.
+- **500 con `psycopg.errors....`**: lo para **Postgres** (`UNIQUE`, FK...). Tu
+  función sí se ejecutó, el `INSERT`/`UPDATE`/`DELETE` falló, y `get_conn` hizo
+  `ROLLBACK`. El cliente no sabe qué ha pasado: eso lo arregla la lección 9.
+
+
+---
+
+## Lección 9 — Errores, códigos HTTP y paginación
+
+### 9.0 El mapa
+
+En la lección 8 quedaron tres casos que responden **500**:
+
+| Caso | Excepción | Qué ha pasado de verdad |
+|---|---|---|
+| Crear o editar con un email repetido | `UniqueViolation` | El **cliente** pidió algo que choca con lo que hay |
+| Borrar un usuario con pedidos | `ForeignKeyViolation` | El **cliente** pidió algo que la base de datos no permite |
+| Crear un pedido justo cuando borran al usuario | `ForeignKeyViolation` | El usuario ya **no existe** |
+
+Un 500 dice "**mi** código ha fallado", pero en los tres casos el código está
+bien: Postgres ha hecho su trabajo (`UNIQUE`, FK) y ha parado algo que el
+cliente no debía hacer. El problema es que **nadie traduce** ese "no" de Postgres
+a un código HTTP. Esta lección va de esa traducción:
+
+```
+Postgres dice "no" (excepción de psycopg)
+  └─▶ tu código la captura (try/except o un handler global)
+        └─▶ la convierte en HTTPException(409 / 404, "mensaje claro")
+              └─▶ el cliente recibe un 4xx y sabe qué ha hecho mal
+```
+
+Y al final, **paginación**: no devolver la tabla entera en cada `GET /usuarios`.
+
+---
+
+### 9.1 Qué código usar: la culpa y el motivo
+
+La primera cifra dice **de quién es la culpa**; las otras dos, **el motivo**:
+
+| Código | Cuándo | En nuestra API |
+|---|---|---|
+| **400** Bad Request | Petición mal hecha, en general | Casi no lo usarás: FastAPI ya da 422 para los datos mal formados |
+| **401** Unauthorized | No sé **quién eres** (falta login o token) | Lección de autenticación |
+| **403** Forbidden | Sé quién eres, pero **no puedes** | Ídem |
+| **404** Not Found | Lo que pides **no existe** | `GET /usuarios/999`, pedido para un usuario que no existe |
+| **409** Conflict | Los datos son válidos, pero **chocan con el estado actual** | Email repetido, borrar un usuario con pedidos |
+| **422** Unprocessable Content | Los datos **no cumplen el formato** | Pydantic: email inválido, `importe: -5` |
+| **500** Internal Server Error | **Bug tuyo**: algo que no habías previsto | Excepción sin capturar |
+| **503** Service Unavailable | El servidor no puede atender **ahora** | La base de datos está caída |
+
+**422 o 409, la duda típica:**
+- **422** = "lo que mandas está **mal en sí mismo**". Lo sabes **sin mirar la base
+  de datos**: `"no-es-email"` es inválido ahora y siempre.
+- **409** = "lo que mandas está bien, pero **choca con lo que ya hay**". Solo lo
+  sabes **mirando la base de datos**: `luis@mail.com` es un email perfecto, pero ya
+  está cogido. Si Luis se borra, el mismo body funcionaría.
+
+> 💡 Regla: un **500** en producción siempre es un bug que hay que arreglar. Los
+> errores previsibles ("no existe", "repetido", "tiene hijos") tienen que salir
+> como **4xx**, con un mensaje que le diga al cliente qué hacer.
+
+---
+
+### 9.2 Repaso de Python: `try` / `except`
+
+Las excepciones **suben** por las funciones hasta que alguien las captura. Si
+nadie lo hace, llegan a FastAPI, que responde 500.
+
+```python
+try:
+    resultado = 10 / divisor          # código que puede fallar
+except ZeroDivisionError:             # si falla CON ESTE TIPO de error...
+    resultado = 0                     # ...se ejecuta esto, y el programa sigue
+```
+
+| Pieza | Qué hace |
+|---|---|
+| `try:` | "Intenta esto" |
+| `except Tipo:` | Si dentro del `try` salta una excepción **de ese tipo** (o de un tipo hijo), entra aquí. Si es de otro tipo, **no** la captura y sigue subiendo |
+| `except Tipo as e:` | Igual, pero guarda la excepción en `e` para mirar sus datos |
+| `raise OtraCosa(...)` dentro del `except` | **Traducir**: cambiar una excepción por otra. Es lo que haremos: `UniqueViolation` → `HTTPException(409)` |
+
+**Las excepciones son clases con herencia** (7.1b). Las de psycopg forman un
+árbol (comprobado con `type(e).__mro__`):
+
+```
+Exception
+ └─ psycopg.Error
+     └─ DatabaseError
+         └─ IntegrityError               ← "se ha roto una regla de integridad"
+             ├─ UniqueViolation          ← UNIQUE / PRIMARY KEY repetido
+             ├─ ForeignKeyViolation      ← FK
+             ├─ CheckViolation           ← CHECK
+             └─ NotNullViolation         ← NOT NULL
+```
+
+`except IntegrityError:` captura las cuatro de golpe; `except UniqueViolation:`
+solo esa. **Captura siempre lo más concreto posible**: si capturas
+`Exception`, te tragas también tus bugs, y un 500 que debía avisarte se
+convierte en un 409 falso.
+
+---
+
+### 9.3 Capturar el error de Postgres en el endpoint → 409
+
+```python
+from psycopg import errors
+
+@app.post("/usuarios", response_model=UsuarioLeer, status_code=201)
+def crear_usuario(usuario: UsuarioCrear, conn: Conn):
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                INSERT INTO usuarios (nombre, email)
+                VALUES (%(nombre)s, %(email)s)
+                RETURNING id, nombre, email, activo, creado_en
+            """, usuario.model_dump())
+            return cur.fetchone()
+    except errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
+```
+
+Comprobado: `POST {"nombre": "D", "email": "luis@mail.com"}` →
+`409 {"detail": "Ya existe un usuario con ese email"}`.
+
+| Pieza | Qué hace |
+|---|---|
+| `from psycopg import errors` | El módulo con **una clase por cada error de Postgres** (`errors.UniqueViolation`, `errors.ForeignKeyViolation`...) |
+| `try:` alrededor del `with` | Solo envuelve el código que puede chocar con la base de datos |
+| `except errors.UniqueViolation:` | Solo este error. Un error de sintaxis SQL (un bug tuyo) **no** entra aquí y sigue dando 500, que es lo correcto |
+| `raise HTTPException(409, ...)` | La traducción. Esta excepción sube por `get_conn` → **`ROLLBACK`** → FastAPI responde 409 |
+
+**¿Y la transacción?** Tras un error, Postgres marca la transacción como **rota**
+(el `curso=!#` de `psql`, lección 4.5). Aquí no importa: el `HTTPException` sale
+de la función, `get_conn` hace `ROLLBACK` y la conexión vuelve limpia al pool.
+Lo que **no** puedes hacer es capturar el error y **seguir usando la conexión**
+(comprobado):
+
+```python
+try:
+    conn.execute("INSERT ... 'luis@mail.com'")
+except errors.UniqueViolation:
+    pass                       # ❌ "me lo trago y sigo"
+conn.execute("SELECT 1")
+# psycopg.errors.InFailedSqlTransaction: current transaction is aborted,
+#   commands ignored until end of transaction block   → 500
+```
+
+Es el mismo `curso=!#` de `psql`: hasta el `ROLLBACK`, todo lo demás falla. Por eso
+la regla es **capturar y salir** (`raise HTTPException`), no capturar y continuar.
+
+#### Saber **qué** regla se ha roto: `e.diag`
+
+Si una tabla tiene **varios** `UNIQUE` (email y DNI, por ejemplo), los dos dan
+`UniqueViolation`. Para dar el mensaje correcto, mira cuál ha sido:
+
+```python
+except errors.UniqueViolation as e:
+    if e.diag.constraint_name == "usuarios_email_key":
+        raise HTTPException(409, "Ya existe un usuario con ese email")
+    raise                       # otro UNIQUE que no esperaba → que siga subiendo (500)
+```
+
+| Atributo | Ejemplo (comprobado) | Qué es |
+|---|---|---|
+| `e.diag.constraint_name` | `"usuarios_email_key"` | El **nombre de la restricción** (lo ves en `\d usuarios`) |
+| `e.sqlstate` | `"23505"` | El código de error estándar de SQL. `23505` = unique, `23503` = FK, `23514` = check, `23502` = not null |
+
+`raise` a secas dentro de un `except` = "**vuelve a lanzar** la misma excepción":
+no sé qué hacer con ella, que siga subiendo.
+
+---
+
+### 9.4 ¿Comprobar antes o intentar y capturar?
+
+En el ejercicio 7 hiciste "**comprobar antes**": `SELECT 1` y, si no existe, 404.
+La alternativa es "**intentar y capturar**": hacer el `INSERT` directamente y, si
+salta la FK, 404.
+
+```python
+# A) Comprobar antes (lo que hiciste)
+cur.execute("SELECT 1 FROM usuarios WHERE id = %s", (usuario_id,))
+if cur.fetchone() is None:
+    raise HTTPException(404, "Usuario no encontrado")
+cur.execute("INSERT INTO pedidos ...")
+
+# B) Intentar y capturar
+try:
+    cur.execute("INSERT INTO pedidos ...")
+except errors.ForeignKeyViolation:
+    raise HTTPException(404, "Usuario no encontrado")
+```
+
+| | A) Comprobar antes | B) Intentar y capturar |
+|---|---|---|
+| Consultas | 2 | 1 |
+| Se lee | Muy claro | Hay que saber qué FK puede saltar |
+| **Carrera** (*race condition*) | Entre el `SELECT` y el `INSERT` otra petición puede borrar al usuario → la FK salta igual → **500** | No hay hueco: la comprobación **es** el `INSERT` |
+
+**La conclusión importante:** aunque compruebes antes, la restricción de Postgres
+puede saltar igual (dos peticiones a la vez). Con el email pasa lo mismo: si
+haces `SELECT ... WHERE email = ...` antes de insertar, dos `POST` simultáneos
+con el mismo email pueden pasar los dos el `SELECT`, y uno choca con el `UNIQUE`.
+**La única fuente de verdad es la restricción de la base de datos**, y su
+excepción hay que capturarla siempre. Comprobar antes es opcional; capturar, no.
+
+---
+
+### 9.5 Un handler global: traducir en **un solo sitio**
+
+Si diez endpoints pueden dar `ForeignKeyViolation`, poner diez `try/except` es
+repetir código. FastAPI deja registrar una función que **traduce un tipo de
+excepción en toda la app**:
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from psycopg import errors
+
+@app.exception_handler(errors.ForeignKeyViolation)
+def fk_violation(request: Request, exc: errors.ForeignKeyViolation):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "La operación choca con datos relacionados"},
+    )
+```
+
+Comprobado: `DELETE /usuarios/1` (Luis, con pedidos) → **409** sin tocar el
+endpoint del DELETE.
+
+#### Cómo se usa: **no lo llamas tú**
+
+Un handler es como un endpoint: lo **registras** con un decorador y FastAPI lo
+llama solo cuando toca. Nunca escribes `fk_violation(...)` en ningún sitio.
+
+**Dónde va:** en `main.py`, **después** de `app = FastAPI(...)` (el decorador
+necesita que `app` exista) y normalmente **antes** de los endpoints:
+
+```python
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from psycopg import errors
+...
+
+app = FastAPI(lifespan=lifespan)
+
+# ── handlers de errores ──────────────────────────────────────────
+@app.exception_handler(errors.ForeignKeyViolation)
+def fk_violation(request: Request, exc: errors.ForeignKeyViolation):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "La operación choca con datos relacionados"},
+    )
+
+# ── endpoints ────────────────────────────────────────────────────
+@app.delete("/usuarios/{usuario_id}", status_code=204)
+def borrar_usuario(usuario_id: int, conn: Conn):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM usuarios WHERE id = %s", (usuario_id,))   # ← sin try/except
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+```
+
+El endpoint **no sabe nada** del handler: se escribe como si el error no
+existiera. Lo que pasa con `DELETE /usuarios/1`:
+
+```
+1. borrar_usuario ejecuta el DELETE
+2. Postgres: "Luis tiene pedidos" → psycopg lanza ForeignKeyViolation
+3. nadie la captura en el endpoint → sube...
+4. ...pasa por get_conn → ROLLBACK
+5. llega a FastAPI. ¿Hay un handler para ForeignKeyViolation? Sí → llama a fk_violation(request, exc)
+6. fk_violation devuelve un JSONResponse → eso es lo que recibe el cliente:
+     HTTP/1.1 409 Conflict
+     {"detail": "La operación choca con datos relacionados"}
+```
+
+Sin el handler, en el paso 5 FastAPI no encuentra a nadie y responde **500**.
+
+**Qué excepciones atrapa:** las del tipo indicado **y sus hijas** (9.2). Así que:
+
+| Registras | Atrapa |
+|---|---|
+| `errors.ForeignKeyViolation` | Solo los fallos de FK |
+| `errors.IntegrityError` | FK, `UNIQUE`, `CHECK` y `NOT NULL` |
+
+Puedes registrar **varios** handlers, uno por tipo. Si hay uno para el hijo y
+otro para el padre, gana el **más concreto**.
+
+**Usar `exc` para afinar el mensaje:** el handler recibe la excepción, así que
+puede mirar qué restricción saltó (9.3):
+
+```python
+@app.exception_handler(errors.ForeignKeyViolation)
+def fk_violation(request: Request, exc: errors.ForeignKeyViolation):
+    if exc.diag.constraint_name == "pedidos_usuario_id_fkey":
+        mensaje = "El usuario tiene pedidos o no existe"
+    else:
+        mensaje = "La operación choca con datos relacionados"
+    return JSONResponse(status_code=409, content={"detail": mensaje})
+```
+
+| Pieza | Qué hace |
+|---|---|
+| `@app.exception_handler(Tipo)` | "Cuando una excepción de este tipo llegue sin capturar hasta FastAPI, llama a esta función en vez de responder 500" |
+| `request: Request` | La petición que falló (aquí no la usamos, pero FastAPI la pasa siempre) |
+| `exc` | La excepción: puedes mirar `exc.diag.constraint_name` |
+| `JSONResponse(...)` | Un handler no puede lanzar `HTTPException`: tiene que **devolver la respuesta** directamente. `content=` es el body; usa `{"detail": ...}` para que tenga la misma forma que los demás errores |
+
+**El `ROLLBACK` sigue ocurriendo**: la excepción pasa primero por `get_conn`
+(`scope="function"`) y después llega al handler.
+
+**¿Handler global o `try/except` en el endpoint?**
+
+| | `try/except` en el endpoint | Handler global |
+|---|---|---|
+| Mensaje | **Específico**: "Ya existe un usuario con ese email" | **Genérico**: no sabe qué endpoint era |
+| Código | Puede ser distinto por endpoint (404 al crear pedido, 409 al borrar usuario) | El mismo para todos |
+| Repetición | Uno por endpoint | Uno para toda la app |
+
+Lo habitual es **las dos cosas**: `try/except` donde quieres un mensaje concreto,
+y un handler global como **red de seguridad** para los casos que se te pasen. Si
+el endpoint captura la excepción, el handler global ya no la ve.
+
+---
+
+### 9.6 Paginación: `LIMIT` y `OFFSET`
+
+`GET /usuarios` devuelve **toda** la tabla. Con 6 filas da igual; con 2 millones
+tumbas la API, la base de datos y el navegador. Se devuelve **por páginas**.
+
+**En SQL:**
+
+```sql
+SELECT ... FROM usuarios ORDER BY id LIMIT 2 OFFSET 0;   -- página 1: filas 1-2
+SELECT ... FROM usuarios ORDER BY id LIMIT 2 OFFSET 2;   -- página 2: filas 3-4
+SELECT ... FROM usuarios ORDER BY id LIMIT 2 OFFSET 4;   -- página 3: filas 5-6
+```
+
+| Pieza | Qué hace |
+|---|---|
+| `LIMIT n` | Devuelve **como mucho** `n` filas |
+| `OFFSET m` | Se **salta** las `m` primeras |
+| `ORDER BY` | **Obligatorio** en la práctica. Sin él, Postgres no garantiza ningún orden, y la "página 2" podría repetir filas de la 1 o saltarse alguna |
+
+**En la API**, `limite` y `offset` llegan por la consulta (`?limite=2&offset=2`), y
+hay que **ponerles límites**. Si no, `?limite=10000000` vuelve a tumbarlo todo:
+
+```python
+from typing import Annotated
+from fastapi import Query
+
+@app.get("/usuarios", response_model=list[UsuarioLeer])
+def listar_usuarios(
+    conn: Conn,
+    limite: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT id, nombre, email, activo, creado_en
+            FROM usuarios
+            ORDER BY id
+            LIMIT %(limite)s OFFSET %(offset)s
+        """, {"limite": limite, "offset": offset})
+        return cur.fetchall()
+```
+
+| Pieza | Qué hace |
+|---|---|
+| `Query(ge=1, le=100)` | Lo mismo que `Field` (8.2c), pero para parámetros **de la consulta**. `?limite=500` → **422** `Input should be less than or equal to 100` (comprobado) |
+| `Annotated[int, Query(...)]` | El mismo `Annotated` de `Conn` (7.5): tipo + metadato |
+| `= 20` | Valor por defecto: sin `?limite`, 20 |
+| `LIMIT %(limite)s` | `LIMIT` y `OFFSET` son **valores**, así que van con marcador como cualquier otro (7.7) |
+
+#### Devolver también el total
+
+Para pintar "Página 2 de 5", el cliente necesita saber **cuántos hay en total**.
+Se devuelve un objeto que envuelve la lista:
+
+```json
+{"items": [{"id": 3, ...}, {"id": 4, ...}], "total": 6, "limite": 2, "offset": 2}
+```
+
+```python
+class PaginaUsuarios(BaseModel):
+    items: list[UsuarioLeer]
+    total: int
+    limite: int
+    offset: int
+```
+
+El total es otra consulta: `SELECT count(*) AS total FROM usuarios` (con el mismo
+`WHERE` que el listado, si lo hay).
+
+> 💡 **`OFFSET` se vuelve lento con tablas enormes**: para dar la página 10.000,
+> Postgres tiene que leer y descartar todas las filas anteriores. La alternativa
+> es la **paginación por cursor** (*keyset*): "dame 20 a partir del id 4.381" →
+> `WHERE id > %s ORDER BY id LIMIT 20`, que usa el índice y va igual de rápido en
+> cualquier página. Para listados de una aplicación interna, `LIMIT`/`OFFSET` va
+> de sobra.
+
+#### Filtros opcionales: `NULL` como "no filtres"
+
+`?activo=true` → solo activos; sin `?activo` → todos. Con un solo SQL:
+
+```python
+activo: bool | None = None
+...
+WHERE (%(activo)s::boolean IS NULL OR activo = %(activo)s)
+```
+
+- Si no viene, `activo` es `None` → `NULL IS NULL` es cierto → el `WHERE` deja pasar todo.
+- Si viene, la primera parte es falsa y manda la segunda: `activo = true`.
+- **El `::boolean` es obligatorio** (comprobado). Sin él, Postgres recibe un
+  `NULL` suelto y no sabe de qué tipo es:
+  `psycopg.errors.AmbiguousParameter: could not determine data type of parameter $1` → 500.
+  `::tipo` es el *cast* de Postgres: "trata esto como un booleano".
+
+---
+
+### 9.7 ✏️ Ejercicios de la lección 9
+
+**Ejercicio 1: email repetido → 409**
+En `POST /usuarios` y `PATCH /usuarios/{id}`, captura `UniqueViolation` y responde
+**409** `"Ya existe un usuario con ese email"`. Pruébalo con `luis@mail.com` en los
+dos.
+❓ Si un día añades otra columna `UNIQUE`, ¿qué mensaje saldría? ¿Cómo lo evitas? (9.3, `e.diag`)
+
+**Ejercicio 2: borrar un usuario con pedidos → 409**
+`DELETE /usuarios/1` (Luis) → **409** `"El usuario tiene pedidos"`. Hazlo con
+`try/except` en el endpoint.
+
+**Ejercicio 3: pedido para un usuario que no existe → "intentar y capturar"**
+Reescribe `POST /usuarios/{usuario_id}/pedidos` **sin** el `SELECT 1`: haz el
+`INSERT` directamente y convierte `ForeignKeyViolation` en **404**. Comprueba que
+`/usuarios/999/pedidos` sigue dando 404.
+❓ ¿Por qué esta versión no tiene el problema de la carrera? (9.4)
+
+**Ejercicio 4: red de seguridad global**
+Añade un `@app.exception_handler(errors.IntegrityError)` que responda **409**
+`{"detail": "Conflicto con los datos existentes"}`.
+Para probarlo, **comenta** temporalmente el `try/except` del ejercicio 2 y repite
+`DELETE /usuarios/1`. ¿Sale el mensaje del handler? Vuelve a descomentarlo: ¿cuál
+gana ahora, y por qué?
+
+**Ejercicio 5: paginación**
+`GET /usuarios?limite=2&offset=0` → los 2 primeros. Devuelve el objeto
+`PaginaUsuarios` con `items`, `total`, `limite` y `offset`. Pruébalo con:
+1. Sin parámetros → defecto `limite=20`, `offset=0`.
+2. `?limite=2&offset=2` → ¿qué ids salen?
+3. `?offset=100` → ¿qué devuelve? ¿Es un 404? (8.5: lista vacía ≠ no existe)
+4. `?limite=0`, `?limite=500`, `?offset=-1` → 422.
+
+**Ejercicio 6: filtro opcional**
+Añade `?activo=true|false` al listado del ejercicio 5. El `total` tiene que
+contar **con el mismo filtro**: con `?activo=false`, ¿cuánto vale `total`?
+Prueba primero **sin** el `::boolean` para ver el error.
+
+**🎯 Bonus: paginar los pedidos**
+Aplica la paginación a `GET /usuarios/{usuario_id}/pedidos`. ¿Qué pasa con el 404
+si el usuario existe pero `offset` se sale de sus pedidos?
+
+> 💡 Al acabar, **ningún** caso de los ejercicios de la lección 8 debería dar 500.
+> Repasa la tabla de 8.12: los ⏳ tienen que pasar a 409 o 404.
+
+---
+
+### 9.8 📋 Chuleta: errores de psycopg → código HTTP
+
+Postgres tiene **cientos** de errores, pero en una API te vas a encontrar unos 30.
+Cada error de Postgres trae un **SQLSTATE**: un código de 5 caracteres que es
+estándar de SQL. Las **dos primeras cifras son la familia** (`23` = integridad,
+`42` = tu SQL está mal...). psycopg tiene **una clase por código**, y cada clase
+hereda de una **clase padre** según su familia. Los nombres y la herencia de
+estas tablas están sacados del propio psycopg instalado (`errors.lookup("23505")`).
+
+#### El árbol de familias
+
+```
+psycopg.Error
+├─ InterfaceError         ← error de psycopg, no de Postgres (cursor cerrado...)
+└─ DatabaseError
+    ├─ IntegrityError     ← 23xxx: se ha roto una restricción (UNIQUE, FK, CHECK, NOT NULL)
+    ├─ DataError          ← 22xxx: un valor no vale para su tipo (texto largo, número enorme...)
+    ├─ ProgrammingError   ← 42xxx: el SQL está mal o no tienes permiso (bug o configuración)
+    ├─ OperationalError   ← 08, 28, 40, 53, 57xxx: problemas de conexión, bloqueos, servidor caído
+    └─ InternalError      ← 25xxx: estado de la transacción (rota, solo lectura...)
+```
+
+La pregunta clave para elegir el código HTTP es siempre la de 9.1: **¿de quién es
+la culpa?** Si es del cliente → 4xx. Si es tuya → 500 (y se arregla el código). Si
+es de la infraestructura → 503.
+
+#### 23 · `IntegrityError`: restricciones → **casi siempre culpa del cliente**
+
+| SQLSTATE | `errors.` | Cuándo salta | HTTP |
+|---|---|---|---|
+| `23505` | `UniqueViolation` | `UNIQUE` o `PRIMARY KEY` repetido: email que ya existe | **409** |
+| `23503` | `ForeignKeyViolation` | Borrar un padre con hijos (Luis con pedidos) | **409** |
+| `23503` | `ForeignKeyViolation` | Crear un hijo que apunta a un padre que no existe (pedido para el usuario 999) | **404** |
+| `23502` | `NotNullViolation` | Un `NULL` en columna `NOT NULL` | **422** si viene del cliente · **500** si es un bug tuyo (te olvidaste una columna en el `INSERT`) |
+| `23514` | `CheckViolation` | Un `CHECK` (`importe >= 0`) | **422**. Si llega aquí es que a tu modelo Pydantic le falta la regla: añádela |
+| `23P01` | `ExclusionViolation` | `EXCLUDE` (p. ej. dos reservas de la misma sala que se solapan) | **409** |
+
+#### 22 · `DataError`: el valor no cabe en su tipo → **cliente, o validación que te falta**
+
+| SQLSTATE | `errors.` | Cuándo salta (mensaje real) | HTTP |
+|---|---|---|---|
+| `22001` | `StringDataRightTruncation` | Texto más largo que un `varchar(n)`: `value too long for type character varying(100)` | **422** (pon `max_length` en Pydantic) |
+| `22003` | `NumericValueOutOfRange` | Número que no cabe: `numeric field overflow` (`99999999999` en `numeric(10,2)`) | **422** (pon `max_digits`) |
+| `22P02` | `InvalidTextRepresentation` | Texto que no se puede convertir: `invalid input syntax for type integer: "abc"` | **422** · normalmente Pydantic lo para antes |
+| `22007` | `InvalidDatetimeFormat` | Fecha con formato inválido | **422** |
+| `22008` | `DatetimeFieldOverflow` | Fecha imposible (`2026-02-30`) | **422** |
+| `22012` | `DivisionByZero` | `division by zero` en tu SQL | **500** (bug: protege la división) |
+
+> 💡 Si un `DataError` o un `CheckViolation` llegan a Postgres, casi siempre
+> significa que **a tu modelo Pydantic le falta una regla**. Lo ideal es que el
+> cliente reciba un 422 de Pydantic y Postgres no llegue a quejarse.
+
+#### 42 · `ProgrammingError`: tu SQL o tus permisos → **siempre 500**
+
+Ninguno es culpa del cliente: **no los traduzcas**, arréglalos.
+
+| SQLSTATE | `errors.` | Cuándo salta | Qué hacer |
+|---|---|---|---|
+| `42601` | `SyntaxError` | SQL mal escrito (`WHERE id == %s`, `JOIN` sin `ON`) | Arreglar el SQL |
+| `42P01` | `UndefinedTable` | Tabla que no existe (errata, o schema equivocado) | Revisar nombre y `search_path` |
+| `42703` | `UndefinedColumn` | Columna que no existe | Revisar nombre (`\d tabla`) |
+| `42883` | `UndefinedFunction` | Función u operador que no existe para esos tipos (`operator does not exist`) | Revisar tipos, a veces falta un `::tipo` |
+| `42702` | `AmbiguousColumn` | Con `JOIN`, `id` sin decir de qué tabla | Prefijo: `u.id` |
+| `42P08` | `AmbiguousParameter` | Un `%s` cuyo tipo Postgres no puede deducir (`%(activo)s IS NULL`) | Añadir `::tipo` (9.6) |
+| `42P18` | `IndeterminateDatatype` | Parecido: no puede deducir el tipo de un parámetro | Añadir `::tipo` |
+| `42501` | `InsufficientPrivilege` | `permission denied for table ...` | `GRANT` al rol de la API (8.10). **No** es un 403: el cliente no ha hecho nada mal, es **tu** configuración |
+| `3D000` | `InvalidCatalogName` | La base de datos de la URL no existe | Revisar `DATABASE_URL` |
+
+#### 25 · `InternalError`: estado de la transacción
+
+| SQLSTATE | `errors.` | Cuándo salta | HTTP |
+|---|---|---|---|
+| `25P02` | `InFailedSqlTransaction` | Seguir usando la conexión tras un error: `current transaction is aborted` (9.3) | **500** (bug: captura y **sal**, no sigas) |
+| `25006` | `ReadOnlySqlTransaction` | Escribir en una réplica de solo lectura o en una transacción `READ ONLY` | **500** (configuración) |
+
+#### 40 / 55 / 57 / 53 / 08 / 28 · `OperationalError`: la infraestructura → **503** o reintentar
+
+| SQLSTATE | `errors.` | Cuándo salta | HTTP |
+|---|---|---|---|
+| `40001` | `SerializationFailure` | Dos transacciones chocan en aislamiento `SERIALIZABLE` | **Reintentar** la transacción; si sigue, 503 |
+| `40P01` | `DeadlockDetected` | Interbloqueo: dos transacciones se esperan mutuamente | **Reintentar**; si sigue, 503 |
+| `55P03` | `LockNotAvailable` | `SELECT ... FOR UPDATE NOWAIT` y la fila está bloqueada | **409** o reintentar |
+| `57014` | `QueryCanceled` | La consulta superó el `statement_timeout` | **503** (o 504) |
+| `57P01` | `AdminShutdown` | Postgres se está apagando / reiniciando | **503** |
+| `57P03` | `CannotConnectNow` | Postgres está arrancando | **503** |
+| `53300` | `TooManyConnections` | Se alcanzó `max_connections` | **503** (revisa el `max_size` del pool) |
+| `53100` | `DiskFull` | Sin espacio en disco | **503** |
+| `08006` | `ConnectionFailure` | Se cortó la conexión a mitad | **503** |
+| `28P01` | `InvalidPassword` | Contraseña mala | Configuración (`.env`) |
+
+> ⚠️ **Al conectar, psycopg no usa estas subclases** (comprobado): tanto con el
+> servidor apagado como con contraseña mala lanza un `psycopg.OperationalError`
+> genérico, con `sqlstate = None` y el motivo solo en el mensaje
+> (`password authentication failed...`, `Is the server running...?`). Para
+> "la base de datos no está disponible", captura `psycopg.OperationalError`.
+
+#### ⚠️ "No existe" **no es un error** para Postgres → el 404 lo pones tú
+
+Un `UPDATE`, `DELETE` o `SELECT` con un `WHERE id = 999` que no encuentra nada
+**no lanza ninguna excepción**. Para Postgres, "he actualizado 0 filas" es un
+resultado perfectamente válido (en `psql` verías `UPDATE 0`). Por eso **no hay
+ninguna clase de psycopg que capturar**: tienes que **preguntar** cuántas filas
+se han tocado y lanzar tú el 404.
+
+| Sentencia | Cómo detectas "no existía" | Lo viste en |
+|---|---|---|
+| `SELECT ... WHERE id = %s` | `cur.fetchone()` devuelve `None` | 7.8 |
+| `UPDATE ... RETURNING ...` (PATCH) | `cur.fetchone()` devuelve `None` | 8.7 |
+| `DELETE ...` sin `RETURNING` | `cur.rowcount == 0` | 8.8 |
+| `DELETE ... RETURNING ...` | `cur.fetchone()` devuelve `None` | 8.12 (tu DELETE) |
+| `INSERT` de un hijo con un padre que no existe | **Aquí sí** hay excepción: `ForeignKeyViolation` | 9.4 |
+
+```python
+# PATCH: el UPDATE no falla, simplemente no devuelve fila
+usuario = cur.fetchone()          # None si ningún usuario tenía ese id
+if usuario is None:
+    raise HTTPException(status_code=404, detail="Usuario no encontrado")
+```
+
+**La regla:** una excepción de psycopg = Postgres ha dicho "**no puedo**" (choca
+con una regla). Un resultado vacío = Postgres ha dicho "**hecho, y no había
+nada**". El primero se **captura**; el segundo se **comprueba**.
+
+#### Errores que **no** vienen de Postgres
+
+| Excepción | Cuándo salta | Ejemplo del curso | HTTP |
+|---|---|---|---|
+| `psycopg.InterfaceError` | Usar algo ya cerrado | `the cursor is closed` (8.6) | **500** (bug) |
+| `psycopg.ProgrammingError` (sin SQLSTATE) | psycopg rechaza tu consulta antes de enviarla | `%(activo)` sin la `s` (8.6) | **500** (bug) |
+| `TypeError` | Parámetros mal pasados | `object of type 'int' has no len()` (7.11) | **500** (bug) |
+| `psycopg_pool.PoolTimeout` | Ninguna conexión libre en el pool tras esperar | Muchas peticiones lentas a la vez | **503** |
+
+#### Cómo averiguar cualquier otro
+
+```python
+from psycopg import errors
+
+errors.lookup("23505")          # → <class 'psycopg.errors.UniqueViolation'>
+
+try:
+    ...
+except psycopg.Error as e:
+    print(type(e).__name__, e.sqlstate, e.diag.constraint_name)   # qué es, su código, qué restricción
+```
+
+La lista **completa** de códigos está en la documentación de Postgres:
+*Appendix A. PostgreSQL Error Codes*. El nombre de la clase de psycopg es el
+nombre del apéndice en *CamelCase* (`unique_violation` → `UniqueViolation`).
+
+**Resumen en una línea por familia:**
+
+| Familia | Padre | Culpa | HTTP típico |
+|---|---|---|---|
+| `23` | `IntegrityError` | Cliente | 409 / 404 / 422 |
+| `22` | `DataError` | Cliente (o te falta validar) | 422 |
+| `42` | `ProgrammingError` | **Tuya** | 500: arréglalo |
+| `25` | `InternalError` | Tuya | 500 |
+| `40`, `53`, `57`, `08` | `OperationalError` | Infraestructura | 503 / reintentar |
 
 ---
 
